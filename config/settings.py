@@ -89,8 +89,8 @@ class SignalSettings(BaseSettings):
     
     # Divergence thresholds
     min_divergence_pct: float = 0.08  # 8% probability divergence required
-    min_pm_staleness_seconds: float = 8.0  # PM orderbook must be stale for 8+ seconds
-    max_pm_staleness_seconds: float = 30.0  # Don't trade if too stale (opportunity passed)
+    min_pm_staleness_seconds: float = 3.0  # PM orderbook must be stale for 3+ seconds (lowered from 8)
+    max_pm_staleness_seconds: float = 600.0  # 10 minutes max (PM markets can be slow)
     
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves
@@ -100,7 +100,7 @@ class SignalSettings(BaseSettings):
     # ==========================================================================
     # Spot movement thresholds (supporting filter)
     # ==========================================================================
-    min_spot_move_pct: float = 0.007  # 0.7% absolute minimum
+    min_spot_move_pct: float = 0.003  # 0.3% absolute minimum (lowered from 0.7%)
     atr_multiplier: float = 1.5  # move_threshold = max(0.7%, 1.5 * ATR)
     
     # Escape clause thresholds (allows sub-threshold moves when strongly supported)
@@ -112,10 +112,10 @@ class SignalSettings(BaseSettings):
     escape_clause_confidence_penalty: float = 0.10  # 10% confidence penalty
     
     # Volume authentication (prevents wash trading/fake breakouts)
-    volume_surge_threshold: float = 1.5  # 1.5x average (lowered from 2.0)
+    volume_surge_threshold: float = 1.2  # 1.2x average (lowered to allow more signals)
     
     # Spike concentration (anti-drift filter)
-    spike_concentration_threshold: float = 0.50  # 50% of move in sharpest 10s (lowered)
+    spike_concentration_threshold: float = 0.30  # 30% of move in sharpest 10s (lowered significantly)
     
     # Volatility filter
     max_volatility_30s: float = 0.008  # 0.8% - slightly higher tolerance

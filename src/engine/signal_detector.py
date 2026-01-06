@@ -78,6 +78,11 @@ class SignalDetector:
         # Signal history for deduplication
         self._recent_signals: list[tuple[int, str]] = []  # (timestamp_ms, direction)
         self._signal_cooldown_ms = 10_000  # 10 second cooldown between signals
+        
+        # Rejection tracking for debugging
+        self._rejection_counts: dict[str, int] = {}
+        self._last_rejection_log_ms: int = 0
+        self._rejection_log_interval_ms = 30_000  # Log rejection stats every 30s
     
     # ==========================================================================
     # CORE: Divergence Calculation
@@ -161,6 +166,21 @@ class SignalDetector:
         
         return False
     
+    def _track_rejection(self, reason: str) -> None:
+        """Track rejection reason for periodic logging."""
+        self._rejection_counts[reason] = self._rejection_counts.get(reason, 0) + 1
+        
+        # Periodically log rejection stats
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_rejection_log_ms > self._rejection_log_interval_ms:
+            self._last_rejection_log_ms = now_ms
+            if self._rejection_counts:
+                self.logger.info(
+                    "📊 Signal rejection stats (last 30s)",
+                    rejections=dict(self._rejection_counts),
+                )
+                self._rejection_counts.clear()
+    
     def _check_supporting_conditions(
         self,
         consensus: ConsensusData,
@@ -175,47 +195,74 @@ class SignalDetector:
         """
         # Volume surge - confirms move is real
         if consensus.volume_surge_ratio < settings.signals.volume_surge_threshold:
-            self.logger.debug(
-                "Volume surge insufficient",
-                volume_surge=consensus.volume_surge_ratio,
-                required=settings.signals.volume_surge_threshold,
+            self._track_rejection("volume_low")
+            self.logger.info(
+                "❌ Rejected: Volume surge insufficient",
+                volume_surge=f"{consensus.volume_surge_ratio:.2f}x",
+                required=f"{settings.signals.volume_surge_threshold:.2f}x",
+                divergence=f"{divergence_data.divergence:.1%}",
             )
             return False, RejectionReason.VOLUME_LOW
         
         # Spike concentration - rejects smooth drift
         if consensus.spike_concentration < settings.signals.spike_concentration_threshold:
-            self.logger.debug(
-                "Smooth drift detected",
-                spike_concentration=consensus.spike_concentration,
-                required=settings.signals.spike_concentration_threshold,
+            self._track_rejection("smooth_drift")
+            self.logger.info(
+                "❌ Rejected: Smooth drift (not a spike)",
+                spike_concentration=f"{consensus.spike_concentration:.1%}",
+                required=f"{settings.signals.spike_concentration_threshold:.1%}",
+                divergence=f"{divergence_data.divergence:.1%}",
             )
             return False, RejectionReason.SMOOTH_DRIFT
         
         # Exchange agreement
         if not consensus.agreement:
+            self._track_rejection("no_consensus")
+            self.logger.info("❌ Rejected: No exchange consensus")
             return False, RejectionReason.CONSENSUS_FAILURE
         
         if consensus.agreement_score < settings.signals.min_agreement_score:
-            self.logger.debug(
-                "Poor exchange agreement",
-                agreement_score=consensus.agreement_score,
-                required=settings.signals.min_agreement_score,
+            self._track_rejection("poor_agreement")
+            self.logger.info(
+                "❌ Rejected: Poor exchange agreement",
+                agreement_score=f"{consensus.agreement_score:.1%}",
+                required=f"{settings.signals.min_agreement_score:.1%}",
             )
             return False, RejectionReason.CONSENSUS_FAILURE
         
         # Volatility check
         if consensus.volatility_30s > settings.signals.max_volatility_30s:
+            self._track_rejection("volatility_high")
+            self.logger.info(
+                "❌ Rejected: Volatility too high",
+                volatility=f"{consensus.volatility_30s:.3%}",
+                max_allowed=f"{settings.signals.max_volatility_30s:.3%}",
+            )
             return False, RejectionReason.VOLATILITY_TOO_HIGH
         
         # Liquidity check
         if pm_data.yes_liquidity_best < settings.signals.min_liquidity_eur:
+            self._track_rejection("liquidity_low")
+            self.logger.info(
+                "❌ Rejected: PM liquidity too low",
+                liquidity=f"€{pm_data.yes_liquidity_best:.2f}",
+                required=f"€{settings.signals.min_liquidity_eur:.2f}",
+            )
             return False, RejectionReason.LIQUIDITY_LOW
         
         if pm_data.liquidity_collapsing:
+            self._track_rejection("liquidity_collapsing")
+            self.logger.info("❌ Rejected: Liquidity collapsing")
             return False, RejectionReason.LIQUIDITY_COLLAPSING
         
         # Minimum spot move (prevents noise signals)
         if abs(consensus.move_30s_pct) < settings.signals.min_spot_move_pct:
+            self._track_rejection("insufficient_move")
+            self.logger.info(
+                "❌ Rejected: Spot move too small",
+                spot_move=f"{consensus.move_30s_pct:.2%}",
+                required=f"{settings.signals.min_spot_move_pct:.2%}",
+            )
             return False, RejectionReason.INSUFFICIENT_MOVE
         
         return True, None
@@ -259,24 +306,32 @@ class SignalDetector:
         
         # Primary check: Is divergence actionable?
         if not divergence_data.is_actionable:
-            # Log why not actionable
+            # Log why not actionable (INFO level to help debug)
             if divergence_data.divergence < settings.signals.min_divergence_pct:
-                self.logger.debug(
-                    "Divergence too low",
-                    divergence=f"{divergence_data.divergence:.2%}",
-                    required=f"{settings.signals.min_divergence_pct:.2%}",
-                )
+                self._track_rejection("divergence_low")
+                # Only log if divergence is significant but below threshold
+                if divergence_data.divergence > 0.03:  # 3%+ worth logging
+                    self.logger.info(
+                        "⏸️ Divergence below threshold",
+                        divergence=f"{divergence_data.divergence:.1%}",
+                        required=f"{settings.signals.min_divergence_pct:.1%}",
+                        direction=divergence_data.signal_direction,
+                    )
             elif divergence_data.pm_orderbook_age_seconds < settings.signals.min_pm_staleness_seconds:
-                self.logger.debug(
-                    "PM orderbook too fresh",
+                self._track_rejection("pm_too_fresh")
+                self.logger.info(
+                    "⏸️ PM orderbook too fresh (not stale enough)",
                     pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
                     required=f"{settings.signals.min_pm_staleness_seconds:.1f}s",
+                    divergence=f"{divergence_data.divergence:.1%}",
                 )
             elif divergence_data.pm_orderbook_age_seconds > settings.signals.max_pm_staleness_seconds:
-                self.logger.debug(
-                    "PM orderbook too stale (opportunity passed)",
-                    pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
-                    max_allowed=f"{settings.signals.max_pm_staleness_seconds:.1f}s",
+                self._track_rejection("pm_too_stale")
+                self.logger.info(
+                    "⏸️ PM too stale (opportunity may have passed)",
+                    pm_age=f"{divergence_data.pm_orderbook_age_seconds:.0f}s",
+                    max_allowed=f"{settings.signals.max_pm_staleness_seconds:.0f}s",
+                    divergence=f"{divergence_data.divergence:.1%}",
                 )
             return None
         
