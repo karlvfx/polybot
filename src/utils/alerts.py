@@ -41,10 +41,10 @@ class DiscordAlerter:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
-                    connect=10.0,   # Connection timeout
-                    read=15.0,      # Read timeout
-                    write=10.0,     # Write timeout
-                    pool=5.0,       # Pool timeout
+                    connect=15.0,   # Connection timeout (increased for slow networks)
+                    read=20.0,      # Read timeout
+                    write=15.0,     # Write timeout
+                    pool=10.0,      # Pool timeout
                 ),
                 limits=httpx.Limits(
                     max_keepalive_connections=5,
