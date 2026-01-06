@@ -100,7 +100,7 @@ class SignalSettings(BaseSettings):
     # ==========================================================================
     # Spot movement thresholds (supporting filter)
     # ==========================================================================
-    min_spot_move_pct: float = 0.001  # 0.1% minimum (lowered further)
+    min_spot_move_pct: float = 0.0005  # 0.05% minimum (very low for testing)
     atr_multiplier: float = 1.5  # move_threshold = max(0.7%, 1.5 * ATR)
     
     # Escape clause thresholds (allows sub-threshold moves when strongly supported)
@@ -128,7 +128,7 @@ class SignalSettings(BaseSettings):
     min_mispricing_pct: float = 0.03  # 3% mispricing required
     
     # Liquidity
-    min_liquidity_eur: float = 10.0  # EUR at best price (lowered for testing)
+    min_liquidity_eur: float = 1.0  # EUR at best price (very low for testing)
     liquidity_collapse_threshold: float = 0.60  # Alert if <60% of 30s ago
 
 
