@@ -89,7 +89,7 @@ class SignalSettings(BaseSettings):
     
     # Divergence thresholds
     min_divergence_pct: float = 0.08  # 8% probability divergence required
-    min_pm_staleness_seconds: float = 3.0  # PM orderbook must be stale for 3+ seconds (lowered from 8)
+    min_pm_staleness_seconds: float = 0.0  # Disabled - PM updates fast, don't wait for staleness
     max_pm_staleness_seconds: float = 600.0  # 10 minutes max (PM markets can be slow)
     
     # Spot-implied probability scaling
@@ -112,7 +112,7 @@ class SignalSettings(BaseSettings):
     escape_clause_confidence_penalty: float = 0.10  # 10% confidence penalty
     
     # Volume authentication (prevents wash trading/fake breakouts)
-    volume_surge_threshold: float = 1.2  # 1.2x average (lowered to allow more signals)
+    volume_surge_threshold: float = 1.0  # Disabled (1.0x = no requirement) - fix volume tracking later
     
     # Spike concentration (anti-drift filter)
     spike_concentration_threshold: float = 0.30  # 30% of move in sharpest 10s (lowered significantly)
