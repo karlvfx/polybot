@@ -1,9 +1,22 @@
 """
-Confidence Scoring System v2.
-Calculates a confidence score for trading signals.
+Confidence Scoring System v3 - Divergence-Based.
+
+NEW STRATEGY: Scores signals based on spot-PM divergence, not oracle age.
+
+The core insight: The edge is market maker lag, not oracle lag.
+When spot price moves, there's an 8-12 second window before PM odds adjust.
+
+Primary signals (60% weight):
+- Divergence: How much spot-implied prob differs from PM odds
+- PM Staleness: How long PM orderbook hasn't changed
+
+Supporting factors (40% weight):
+- Consensus strength, liquidity, volume surge, spike concentration
 """
 
-from typing import Optional
+import math
+from datetime import datetime
+from typing import Optional, TYPE_CHECKING
 
 import structlog
 
@@ -11,82 +24,125 @@ from src.models.schemas import (
     SignalCandidate,
     ScoringData,
     ConfidenceBreakdown,
-    VolatilityRegime,
 )
 from config.settings import settings
 
+if TYPE_CHECKING:
+    from src.utils.time_filter import TimeOfDayAnalyzer
+
 logger = structlog.get_logger()
+
+
+def calculate_spot_implied_prob(momentum: float, scale: float = 100.0) -> float:
+    """Convert spot momentum to implied probability."""
+    # Logistic function: momentum in decimal (0.01 = 1%), scale adjusts sensitivity
+    return 1 / (1 + math.exp(-momentum * scale))
 
 
 class ConfidenceScorer:
     """
     Calculates confidence score for trading signals.
     
-    Components (weighted):
-    - Oracle Age Score: 0.35
-    - Spot Consensus Strength: 0.25
-    - Odds Misalignment Score: 0.15
-    - Liquidity Score: 0.10
-    - Spread Anomaly Score: 0.08
-    - Volume Surge Score: 0.04
-    - Spike Concentration Score: 0.03
+    NEW: Divergence-based scoring (v3).
+    
+    Primary Signals (60%):
+    - Divergence Score: 0.40 - Spot-PM probability divergence
+    - PM Staleness Score: 0.20 - How long orderbook hasn't updated
+    
+    Supporting Factors (40%):
+    - Consensus Strength: 0.15 - Exchange agreement quality
+    - Liquidity Score: 0.10 - Available depth + stability
+    - Volume Surge: 0.08 - Move authentication
+    - Spike Concentration: 0.07 - Move quality (spike vs drift)
     """
     
-    def __init__(self):
+    def __init__(self, time_analyzer: Optional["TimeOfDayAnalyzer"] = None):
         self.logger = logger.bind(component="confidence_scorer")
         self.weights = settings.confidence
+        self._time_analyzer = time_analyzer
     
-    def _score_oracle_age(
+    def set_time_analyzer(self, analyzer: "TimeOfDayAnalyzer") -> None:
+        """Set or update the time-of-day analyzer."""
+        self._time_analyzer = analyzer
+    
+    # ==========================================================================
+    # Primary Signal Scores (60% total weight)
+    # ==========================================================================
+    
+    def _score_divergence(
         self,
-        oracle_age: float,
-        volatility_regime: VolatilityRegime,
+        spot_move_pct: float,
+        pm_yes_price: float,
     ) -> float:
         """
-        Score oracle age (0.0 - 1.0).
-        Higher score for optimal age window.
-        """
-        # Get regime-specific thresholds
-        if volatility_regime == VolatilityRegime.LOW:
-            min_age = settings.chainlink.oracle_min_age_low_vol
-            optimal_age = settings.chainlink.oracle_optimal_age_low_vol
-        else:
-            min_age = settings.chainlink.oracle_min_age_normal_vol
-            optimal_age = settings.chainlink.oracle_optimal_age_normal_vol
+        Score spot-PM divergence (0.0 - 1.0).
         
-        if oracle_age < min_age:
+        This is the PRIMARY signal - how much spot movement implies
+        a different probability than what PM is showing.
+        
+        Higher divergence = higher score.
+        """
+        # Calculate spot-implied probability
+        spot_implied = calculate_spot_implied_prob(
+            spot_move_pct,
+            scale=settings.signals.spot_implied_scale,
+        )
+        
+        # Calculate divergence
+        divergence = abs(spot_implied - pm_yes_price)
+        
+        # Normalize: 15% divergence = perfect score
+        # Anything below min_divergence gets 0
+        min_div = settings.signals.min_divergence_pct
+        max_div = 0.15
+        
+        if divergence < min_div:
             return 0.0
-        elif oracle_age <= optimal_age:
-            # Linear increase from min to optimal
-            return (oracle_age - min_age) / (optimal_age - min_age)
+        
+        return min(1.0, (divergence - min_div) / (max_div - min_div))
+    
+    def _score_pm_staleness(self, orderbook_age_seconds: float) -> float:
+        """
+        Score PM orderbook staleness (0.0 - 1.0).
+        
+        Stale orderbook = opportunity hasn't been arbed yet.
+        
+        Window: 8-30 seconds is optimal.
+        - Under 8s: Too fresh, MM might be about to update
+        - 8-15s: Optimal window
+        - 15-30s: Good, but edge may be closing
+        - Over 30s: Opportunity likely passed
+        """
+        min_age = settings.signals.min_pm_staleness_seconds
+        optimal_age = 12.0  # Peak confidence at 12 seconds
+        max_age = settings.signals.max_pm_staleness_seconds
+        
+        if orderbook_age_seconds < min_age:
+            # Too fresh
+            return 0.0
+        elif orderbook_age_seconds <= optimal_age:
+            # Ramping up to optimal
+            return (orderbook_age_seconds - min_age) / (optimal_age - min_age)
+        elif orderbook_age_seconds <= max_age:
+            # Ramping down from optimal
+            return 1.0 - (orderbook_age_seconds - optimal_age) / (max_age - optimal_age)
         else:
-            # Perfect score at or beyond optimal
-            return 1.0
+            # Too stale
+            return 0.0
+    
+    # ==========================================================================
+    # Supporting Factor Scores (40% total weight)
+    # ==========================================================================
     
     def _score_consensus_strength(
         self,
-        price_agreement: float,
-        move_consistency: float,
+        agreement_score: float,
+        move_consistency: float = 0.8,
     ) -> float:
         """
-        Score spot consensus strength (0.0 - 1.0).
-        Based on price agreement and momentum consistency.
+        Score exchange consensus quality (0.0 - 1.0).
         """
-        # Price agreement: 1 - (max deviation / avg price)
-        # Move consistency: min(abs_moves) / max(abs_moves)
-        return (price_agreement + move_consistency) / 2
-    
-    def _score_misalignment(
-        self,
-        spot_implied: float,
-        pm_implied: float,
-    ) -> float:
-        """
-        Score odds misalignment (0.0 - 1.0).
-        Higher score for larger mispricing.
-        """
-        misalignment = abs(pm_implied - spot_implied)
-        # Normalize: 10% misalignment = perfect score
-        return min(1.0, misalignment / 0.10)
+        return (agreement_score + move_consistency) / 2
     
     def _score_liquidity(
         self,
@@ -108,52 +164,33 @@ class ConfidenceScorer:
         
         return base_score * stability_factor
     
-    def _score_spread_anomaly(
-        self,
-        current_spread: float,
-        normal_spread: float = 0.03,
-    ) -> float:
-        """
-        Score spread anomaly (0.0 - 1.0).
-        Wide spread = market confusion = opportunity.
-        """
-        if current_spread <= normal_spread:
-            return 0.0
-        
-        # Score increases with spread above normal
-        return min(1.0, (current_spread - normal_spread) / normal_spread)
-    
-    def _score_volume_surge(
-        self,
-        volume_ratio: float,
-    ) -> float:
+    def _score_volume_surge(self, volume_ratio: float) -> float:
         """
         Score volume surge (0.0 - 1.0).
-        3x volume = perfect score.
+        2.5x volume = perfect score.
         """
         if volume_ratio <= 1.0:
             return 0.0
         
-        # Linear scale from 1x to 3x
-        return min(1.0, (volume_ratio - 1.0) / 2.0)
+        return min(1.0, (volume_ratio - 1.0) / 1.5)
     
-    def _score_spike_concentration(
-        self,
-        concentration: float,
-    ) -> float:
+    def _score_spike_concentration(self, concentration: float) -> float:
         """
         Score spike concentration (0.0 - 1.0).
-        80% concentration = perfect score.
+        70% concentration = perfect score.
         """
-        if concentration <= 0.5:
+        if concentration <= 0.4:
             return 0.0
         
-        # Linear scale from 50% to 80%
-        return min(1.0, (concentration - 0.5) / 0.3)
+        return min(1.0, (concentration - 0.4) / 0.3)
+    
+    # ==========================================================================
+    # Main Scoring Method
+    # ==========================================================================
     
     def score(self, signal: SignalCandidate) -> ScoringData:
         """
-        Calculate full confidence score for a signal.
+        Calculate confidence score using divergence-based strategy.
         
         Args:
             signal: The signal candidate to score
@@ -161,72 +198,70 @@ class ConfidenceScorer:
         Returns:
             ScoringData with total confidence and component breakdown
         """
-        if not signal.consensus or not signal.oracle or not signal.polymarket:
+        if not signal.consensus or not signal.polymarket:
             return ScoringData(
                 confidence=0.0,
                 breakdown=ConfidenceBreakdown(),
             )
         
         consensus = signal.consensus
-        oracle = signal.oracle
         pm = signal.polymarket
         
-        # Calculate individual scores
-        oracle_age_score = self._score_oracle_age(
-            oracle.oracle_age_seconds,
-            consensus.volatility_regime,
+        # ======================
+        # Primary Signals (60%)
+        # ======================
+        
+        # Divergence score (40%)
+        divergence_score = self._score_divergence(
+            consensus.move_30s_pct,
+            pm.yes_bid,
         )
         
-        # Consensus strength
-        price_agreement = 1 - consensus.max_deviation_pct if consensus.max_deviation_pct < 1 else 0
-        move_consistency = 0.8  # Simplified - would compare individual exchange moves
-        consensus_score = self._score_consensus_strength(price_agreement, move_consistency)
+        # PM staleness score (20%)
+        pm_staleness_score = self._score_pm_staleness(pm.orderbook_age_seconds)
         
-        # Misalignment score
-        # Estimate spot-implied probability
-        spot_oracle_divergence = (consensus.consensus_price - oracle.current_value) / oracle.current_value
-        spot_implied = 0.5 + (spot_oracle_divergence * 5)  # Simplified model
-        spot_implied = max(0, min(1, spot_implied))
-        misalignment_score = self._score_misalignment(spot_implied, pm.implied_probability)
+        # ======================
+        # Supporting Factors (40%)
+        # ======================
         
-        # Liquidity score
+        # Consensus strength (15%)
+        consensus_score = self._score_consensus_strength(
+            consensus.agreement_score,
+        )
+        
+        # Liquidity score (10%)
         liquidity_score = self._score_liquidity(
             pm.yes_liquidity_best,
             pm.liquidity_30s_ago,
         )
         
-        # Spread anomaly score
-        spread_score = self._score_spread_anomaly(pm.spread)
-        
-        # Volume surge score
+        # Volume surge score (8%)
         volume_score = self._score_volume_surge(consensus.volume_surge_ratio)
         
-        # Spike concentration score
+        # Spike concentration score (7%)
         spike_score = self._score_spike_concentration(consensus.spike_concentration)
         
         # Create breakdown
         breakdown = ConfidenceBreakdown(
-            oracle_age=oracle_age_score,
+            divergence=divergence_score,
+            pm_staleness=pm_staleness_score,
             consensus_strength=consensus_score,
-            misalignment=misalignment_score,
             liquidity=liquidity_score,
-            spread_anomaly=spread_score,
             volume_surge=volume_score,
             spike_concentration=spike_score,
         )
         
         # Calculate weighted confidence
         confidence = (
-            self.weights.oracle_age_weight * oracle_age_score +
+            self.weights.divergence_weight * divergence_score +
+            self.weights.pm_staleness_weight * pm_staleness_score +
             self.weights.consensus_strength_weight * consensus_score +
-            self.weights.misalignment_weight * misalignment_score +
             self.weights.liquidity_weight * liquidity_score +
-            self.weights.spread_anomaly_weight * spread_score +
             self.weights.volume_surge_weight * volume_score +
             self.weights.spike_concentration_weight * spike_score
         )
         
-        # Apply escape clause penalty
+        # Apply escape clause penalty (if applicable)
         escape_clause_used = signal.signal_type.value == "escape_clause"
         confidence_penalty = 0.0
         
@@ -234,19 +269,29 @@ class ConfidenceScorer:
             confidence_penalty = settings.signals.escape_clause_confidence_penalty
             confidence *= (1 - confidence_penalty)
         
+        # Time-of-day adjustment (optional)
+        time_multiplier = 1.0
+        current_hour = datetime.now().hour
+        
+        if self._time_analyzer:
+            time_multiplier = self._time_analyzer.get_confidence_multiplier(current_hour)
+            confidence *= time_multiplier
+        
+        # Clamp to valid range
+        confidence = max(0.0, min(1.0, confidence))
+        
         self.logger.debug(
-            "Confidence scored",
-            signal_id=signal.signal_id,
-            confidence=confidence,
-            escape_clause_used=escape_clause_used,
+            "Confidence scored (divergence strategy)",
+            signal_id=signal.signal_id[:8] if signal.signal_id else "N/A",
+            confidence=f"{confidence:.2%}",
+            tier=self.get_confidence_tier(confidence),
             breakdown={
-                "oracle_age": oracle_age_score,
-                "consensus": consensus_score,
-                "misalignment": misalignment_score,
-                "liquidity": liquidity_score,
-                "spread": spread_score,
-                "volume": volume_score,
-                "spike": spike_score,
+                "divergence": f"{divergence_score:.2f}",
+                "pm_staleness": f"{pm_staleness_score:.2f}",
+                "consensus": f"{consensus_score:.2f}",
+                "liquidity": f"{liquidity_score:.2f}",
+                "volume": f"{volume_score:.2f}",
+                "spike": f"{spike_score:.2f}",
             },
         )
         
@@ -269,4 +314,3 @@ class ConfidenceScorer:
             return "LOW (★★☆☆☆)"
         else:
             return "POOR (★☆☆☆☆)"
-

@@ -1,15 +1,27 @@
 """
 Polymarket orderbook WebSocket feed.
 Monitors YES/NO token orderbooks for 15-minute up/down markets.
+Includes automatic market discovery for BTC 15-min markets.
+
+Enhanced features:
+- Multi-market discovery and tracking
+- Market quality scoring
+- Best market selection based on quality + mispricing
+- Proper orderbook imbalance detection
 """
 
 import asyncio
 import json
+import re
+import ssl
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional
 
+import certifi
+import httpx
 import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -18,6 +30,617 @@ from src.feeds.base import FeedHealth
 from src.models.schemas import PolymarketData, OrderbookLevel
 
 logger = structlog.get_logger()
+
+
+# --- Market Discovery ---
+
+@dataclass
+class DiscoveredMarket:
+    """A discovered Polymarket market."""
+    condition_id: str
+    question: str
+    description: str
+    end_date_iso: str
+    tokens: list[dict]
+    outcome: str  # "up" or "down"
+    # NEW: Enhanced market metadata
+    created_at_ms: int = 0
+    liquidity: float = 0.0
+    spread: float = 0.0
+    volume_24h: float = 0.0
+    
+    @property
+    def age_seconds(self) -> float:
+        """Get market age in seconds."""
+        if self.created_at_ms == 0:
+            return 0.0
+        return (int(time.time() * 1000) - self.created_at_ms) / 1000
+    
+    @property
+    def time_to_close_seconds(self) -> float:
+        """Get time until market closes."""
+        if not self.end_date_iso:
+            return 900.0  # Default 15 minutes
+        try:
+            end_dt = datetime.fromisoformat(self.end_date_iso.replace('Z', '+00:00'))
+            now = datetime.now(end_dt.tzinfo)
+            return max(0, (end_dt - now).total_seconds())
+        except:
+            return 900.0
+
+
+@dataclass
+class MarketQualityScore:
+    """Quality score breakdown for a market."""
+    total_score: float
+    liquidity_score: float
+    age_score: float
+    spread_score: float
+    time_to_close_score: float
+    
+    def __str__(self) -> str:
+        return f"Quality: {self.total_score:.2f} (liq={self.liquidity_score:.2f}, age={self.age_score:.2f}, spread={self.spread_score:.2f}, ttc={self.time_to_close_score:.2f})"
+    
+
+class MarketDiscovery:
+    """
+    Discovers active BTC 15-minute up/down markets from Polymarket.
+    
+    Enhanced features:
+    - Discovers ALL active markets, not just one
+    - Calculates quality scores for market selection
+    - Supports pre-warming period tracking
+    
+    Markets follow the slug pattern: btc-up-or-down-15m-[TIMESTAMP]
+    where TIMESTAMP is the Unix timestamp of the 15-minute window end.
+    """
+    
+    GAMMA_API_URL = "https://gamma-api.polymarket.com"
+    CLOB_API_URL = "https://clob.polymarket.com"
+    
+    # 15-minute interval in seconds
+    INTERVAL_SECONDS = 15 * 60  # 900 seconds
+    
+    # Quality scoring thresholds
+    TARGET_LIQUIDITY = 10000  # €10k target liquidity
+    MIN_MARKET_AGE = 30  # seconds - markets need time to build liquidity
+    MAX_MARKET_AGE = 300  # seconds - older markets might have stale odds
+    MIN_TIME_TO_CLOSE = 600  # seconds - need at least 10 mins to trade safely
+    
+    # Asset-specific slug patterns and keywords
+    # Primary format: {asset}-updown-15m-{timestamp} (confirmed from Polymarket URLs)
+    # Fallback: {asset}-up-or-down-15m-{timestamp}
+    ASSET_PATTERNS = {
+        "BTC": {
+            "slugs": [
+                "btc-updown-15m",           # Primary format (from polymarket.com/event/btc-updown-15m-*)
+                "btc-up-or-down-15m",       # Alternative format
+                "bitcoin-updown-15m",       # Full name variant
+            ],
+            "keywords": ["bitcoin", "btc"],
+            "name": "Bitcoin",
+            "tag_id": 235,  # Polymarket tag ID for Bitcoin
+        },
+        "ETH": {
+            "slugs": [
+                "eth-updown-15m",           # Primary format
+                "eth-up-or-down-15m",       # Alternative format
+                "ethereum-updown-15m",      # Full name variant
+            ],
+            "keywords": ["ethereum", "eth"],
+            "name": "Ethereum",
+            "tag_id": 236,  # Polymarket tag ID for Ethereum
+        },
+        "SOL": {
+            "slugs": [
+                "sol-updown-15m",           # Primary format
+                "sol-up-or-down-15m",       # Alternative format
+                "solana-updown-15m",        # Full name variant
+            ],
+            "keywords": ["solana", "sol"],
+            "name": "Solana",
+            "tag_id": None,  # No dedicated tag, use keyword search
+        },
+    }
+    
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset.upper()
+        self.logger = logger.bind(component="market_discovery", asset=self.asset)
+        
+        # Get asset-specific patterns
+        if self.asset not in self.ASSET_PATTERNS:
+            self.logger.warning(f"Unknown asset {self.asset}, using BTC patterns")
+            self.asset = "BTC"
+        self._patterns = self.ASSET_PATTERNS[self.asset]
+    
+    def _get_current_window_timestamps(self) -> list[int]:
+        """
+        Get timestamps for current and upcoming 15-minute windows.
+        
+        Polymarket markets use the window END time as the timestamp.
+        Example: btc-updown-15m-1767161700 resolves at Unix time 1767161700
+        
+        Returns list of possible window end timestamps to try (current, next, previous).
+        """
+        now = int(time.time())
+        
+        # Calculate current window end (round up to next 15-min boundary)
+        # Example: if now=1767161500, current_window_end=1767161700
+        current_window_end = ((now // self.INTERVAL_SECONDS) + 1) * self.INTERVAL_SECONDS
+        
+        # Try multiple windows to handle timing edge cases
+        timestamps = [
+            current_window_end,                              # Current window (most likely active)
+            current_window_end + self.INTERVAL_SECONDS,      # Next window (pre-market)
+            current_window_end - self.INTERVAL_SECONDS,      # Previous window (might still be open)
+            current_window_end + (2 * self.INTERVAL_SECONDS), # Two ahead
+        ]
+        
+        self.logger.debug(
+            "Generated window timestamps",
+            now=now,
+            current_window_end=current_window_end,
+            timestamps=timestamps,
+            human_readable=[
+                datetime.utcfromtimestamp(ts).strftime("%H:%M:%S UTC") 
+                for ts in timestamps[:3]
+            ]
+        )
+        
+        return timestamps
+    
+    def _generate_market_slugs(self) -> list[str]:
+        """
+        Generate possible market slugs based on current time and asset.
+        
+        Format: {slug_pattern}-{unix_timestamp}
+        Example: btc-updown-15m-1767161700
+        """
+        timestamps = self._get_current_window_timestamps()
+        slugs = []
+        
+        # Prioritize current window with primary slug format
+        for ts in timestamps:
+            for slug_base in self._patterns["slugs"]:
+                slugs.append(f"{slug_base}-{ts}")
+        
+        self.logger.debug(
+            "Generated market slugs",
+            asset=self.asset,
+            slug_count=len(slugs),
+            first_slugs=slugs[:3],  # Show first 3 (primary format for each timestamp)
+        )
+        
+        return slugs
+    
+    def get_market_url(self, timestamp: int) -> str:
+        """
+        Get the Polymarket URL for a market.
+        
+        Example: https://polymarket.com/event/btc-updown-15m-1767161700
+        """
+        primary_slug = self._patterns["slugs"][0]  # Use primary slug format
+        return f"https://polymarket.com/event/{primary_slug}-{timestamp}"
+    
+    async def find_15min_markets(self) -> list[DiscoveredMarket]:
+        """
+        Find ALL active 15-minute up/down markets for the configured asset.
+        
+        Uses time-based slug pattern: [asset]-up-or-down-15m-[TIMESTAMP]
+        Returns all discovered markets (not just one) for quality-based selection.
+        """
+        markets = []
+        
+        try:
+            markets = await self._fetch_all_current_markets()
+        except Exception as e:
+            self.logger.warning("Market discovery failed", error=str(e), asset=self.asset)
+        
+        if markets:
+            self.logger.info("Market discovery complete", found=len(markets), asset=self.asset)
+        else:
+            self.logger.warning("No 15-minute markets found", asset=self.asset)
+        
+        return markets
+    
+    # Alias for backwards compatibility
+    async def find_btc_15min_markets(self) -> list[DiscoveredMarket]:
+        """Backwards compatible alias for find_15min_markets."""
+        return await self.find_15min_markets()
+    
+    def assess_market_quality(self, market: DiscoveredMarket) -> MarketQualityScore:
+        """
+        Calculate comprehensive quality score for a market (0-1).
+        
+        Scoring weights:
+        - Liquidity: 40% - Higher liquidity = better fills
+        - Age: 30% - 30-300s old is optimal (has liquidity, not stale)
+        - Spread: 20% - Tighter spread = lower slippage
+        - Time-to-close: 10% - Need enough time to trade safely
+        """
+        # Liquidity score (40%)
+        liq_score = min(1.0, market.liquidity / self.TARGET_LIQUIDITY)
+        
+        # Age score (30%) - prefer markets 30-300s old
+        age_s = market.age_seconds
+        if self.MIN_MARKET_AGE <= age_s <= self.MAX_MARKET_AGE:
+            age_score = 1.0
+        elif age_s < self.MIN_MARKET_AGE:
+            age_score = age_s / self.MIN_MARKET_AGE
+        else:
+            # Decay after MAX_MARKET_AGE
+            age_score = max(0.0, 1.0 - (age_s - self.MAX_MARKET_AGE) / self.MAX_MARKET_AGE)
+        
+        # Spread score (20%) - tighter is better (target <5%)
+        if market.spread > 0:
+            spread_score = max(0.0, 1.0 - market.spread / 0.10)
+        else:
+            spread_score = 0.5  # Unknown spread
+        
+        # Time-to-close score (10%) - need at least 10 mins
+        ttc_s = market.time_to_close_seconds
+        if ttc_s > self.MIN_TIME_TO_CLOSE:
+            ttc_score = 1.0
+        else:
+            ttc_score = ttc_s / self.MIN_TIME_TO_CLOSE
+        
+        total_score = (
+            0.40 * liq_score +
+            0.30 * age_score +
+            0.20 * spread_score +
+            0.10 * ttc_score
+        )
+        
+        return MarketQualityScore(
+            total_score=total_score,
+            liquidity_score=liq_score,
+            age_score=age_score,
+            spread_score=spread_score,
+            time_to_close_score=ttc_score,
+        )
+    
+    async def _fetch_all_current_markets(self) -> list[DiscoveredMarket]:
+        """
+        Fetch ALL active 15-min markets for the configured asset using time-based slug pattern.
+        
+        Returns all discovered markets for quality-based selection.
+        """
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        discovered = []
+        seen_condition_ids = set()  # Deduplicate
+        
+        async with httpx.AsyncClient(verify=ssl_context, timeout=15.0) as client:
+            # Try time-based slugs first (primary method)
+            slugs = self._generate_market_slugs()
+            
+            for slug in slugs:
+                try:
+                    self.logger.debug("Trying slug", slug=slug)
+                    response = await client.get(
+                        f"{self.GAMMA_API_URL}/markets",
+                        params={"slug": slug},
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        # Handle both list and single object responses
+                        markets_data = data if isinstance(data, list) else [data] if data else []
+                        
+                        for market in markets_data:
+                            if not market:
+                                continue
+                                
+                            condition_id = market.get("conditionId") or market.get("condition_id", "")
+                            if not condition_id or condition_id in seen_condition_ids:
+                                continue
+                            
+                            # Check if market is active
+                            if market.get("closed", False):
+                                continue
+                            
+                            seen_condition_ids.add(condition_id)
+                            question = market.get("question", f"{self.asset} 15-min ({slug})")
+                            
+                            # Parse clobTokenIds (may be JSON string)
+                            tokens_raw = market.get("clobTokenIds", [])
+                            if isinstance(tokens_raw, str):
+                                tokens = json.loads(tokens_raw)
+                            else:
+                                tokens = tokens_raw
+                            
+                            # Extract additional metadata for quality scoring
+                            liquidity = 0.0
+                            spread = 0.0
+                            created_at_ms = 0
+                            
+                            try:
+                                # Try to get liquidity from outcomePrices or volume
+                                outcome_prices = market.get("outcomePrices", "")
+                                if isinstance(outcome_prices, str) and outcome_prices:
+                                    prices = json.loads(outcome_prices)
+                                    if len(prices) >= 2:
+                                        spread = abs(float(prices[0]) - float(prices[1]))
+                                
+                                # Get volume as liquidity proxy
+                                liquidity = float(market.get("volume", 0) or 0)
+                                
+                                # Get creation time
+                                created_at = market.get("createdAt", "")
+                                if created_at:
+                                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                                    created_at_ms = int(dt.timestamp() * 1000)
+                            except:
+                                pass
+                            
+                            discovered.append(DiscoveredMarket(
+                                condition_id=condition_id,
+                                question=question,
+                                description=market.get("description", "")[:200],
+                                end_date_iso=market.get("endDate", ""),
+                                tokens=tokens,
+                                outcome="up" if "up" in question.lower() else "down",
+                                created_at_ms=created_at_ms,
+                                liquidity=liquidity,
+                                spread=spread,
+                            ))
+                            
+                            self.logger.info(
+                                f"Found {self.asset} 15-min market",
+                                asset=self.asset,
+                                slug=slug,
+                                condition_id=condition_id[:40],
+                                question=question[:50],
+                                liquidity=liquidity,
+                            )
+                            
+                            # DON'T return early - continue to find ALL markets
+                            
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 404:
+                        self.logger.debug("HTTP error", slug=slug, status=e.response.status_code)
+                except Exception as e:
+                    self.logger.debug("Error fetching slug", slug=slug, error=str(e))
+            
+            # Fallback: Search events for 15-min markets
+            if not discovered:
+                discovered = await self._search_events_fallback(client)
+        
+        return discovered
+    
+    async def _search_events_fallback(self, client: httpx.AsyncClient) -> list[DiscoveredMarket]:
+        """
+        Fallback: Search events API for 15-minute crypto markets.
+        
+        Uses tag_id if available, otherwise searches by keywords.
+        API: GET https://gamma-api.polymarket.com/events?active=true&tag_id=235
+        """
+        discovered = []
+        
+        # Get tag_id from asset patterns (if available)
+        tag_id = self._patterns.get("tag_id")
+        keywords = self._patterns["keywords"]
+        
+        self.logger.info(
+            "Attempting events fallback search",
+            asset=self.asset,
+            tag_id=tag_id,
+            keywords=keywords,
+        )
+        
+        try:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": 100,
+            }
+            if tag_id:
+                params["tag_id"] = tag_id
+            
+            response = await client.get(
+                f"{self.GAMMA_API_URL}/events",
+                params=params,
+            )
+            
+            if response.status_code == 200:
+                events = response.json()
+                self.logger.debug("Events API returned", event_count=len(events))
+                
+                for event in events:
+                    title = event.get("title", "").lower()
+                    slug = event.get("slug", "").lower()
+                    
+                    # Look for 15-minute up/down markets
+                    is_15min_market = (
+                        ("15" in title and "min" in title) or 
+                        "up or down" in title or
+                        "updown-15m" in slug or
+                        "up-or-down-15m" in slug
+                    )
+                    
+                    if not is_15min_market:
+                        continue
+                    
+                    # Check if title/slug contains any of our asset keywords
+                    matches_asset = any(kw in title or kw in slug for kw in keywords)
+                    
+                    if matches_asset:
+                        markets = event.get("markets", [])
+                        for m in markets:
+                            condition_id = m.get("conditionId") or m.get("condition_id", "")
+                            if condition_id and not m.get("closed", False):
+                                # Parse tokens
+                                tokens_raw = m.get("clobTokenIds", [])
+                                if isinstance(tokens_raw, str):
+                                    try:
+                                        tokens = json.loads(tokens_raw)
+                                    except:
+                                        tokens = []
+                                else:
+                                    tokens = tokens_raw
+                                
+                                discovered.append(DiscoveredMarket(
+                                    condition_id=condition_id,
+                                    question=m.get("question", event.get("title", "")),
+                                    description=event.get("description", "")[:200],
+                                    end_date_iso=event.get("endDate") or m.get("endDate", ""),
+                                    tokens=tokens,
+                                    outcome="up" if "up" in title else "down",
+                                    liquidity=float(m.get("volume", 0) or 0),
+                                ))
+                                self.logger.info(
+                                    "Found market via events fallback",
+                                    asset=self.asset,
+                                    question=event.get("title", "")[:50],
+                                    condition_id=condition_id[:30],
+                                )
+        except Exception as e:
+            self.logger.warning("Events fallback failed", error=str(e), asset=self.asset)
+        
+        return discovered
+    
+    async def get_current_market(self) -> Optional[DiscoveredMarket]:
+        """Get the current active market (legacy method)."""
+        return await self.get_best_market()
+    
+    async def get_best_market(self, min_quality: float = 0.5) -> Optional[DiscoveredMarket]:
+        """
+        Get the best quality 15-minute market for the configured asset.
+        
+        Args:
+            min_quality: Minimum quality score (0-1) to consider
+            
+        Returns:
+            Best quality market or None if none meet threshold
+        """
+        markets = await self.find_15min_markets()
+        
+        if not markets:
+            return None
+        
+        # Score all markets
+        scored_markets = []
+        for market in markets:
+            quality = self.assess_market_quality(market)
+            if quality.total_score >= min_quality:
+                scored_markets.append((market, quality))
+                self.logger.debug(
+                    "Market scored",
+                    condition_id=market.condition_id[:30],
+                    quality=quality.total_score,
+                    outcome=market.outcome,
+                )
+        
+        if not scored_markets:
+            # Fall back to any market if none meet quality threshold
+            self.logger.warning("No markets meet quality threshold, using best available")
+            scored_markets = [(m, self.assess_market_quality(m)) for m in markets]
+        
+        # Sort by quality score (descending)
+        scored_markets.sort(key=lambda x: x[1].total_score, reverse=True)
+        
+        best_market, best_quality = scored_markets[0]
+        self.logger.info(
+            "Selected best market",
+            condition_id=best_market.condition_id[:30],
+            question=best_market.question[:40],
+            quality_score=best_quality.total_score,
+        )
+        
+        return best_market
+    
+    async def get_all_markets_with_quality(self) -> list[tuple[DiscoveredMarket, MarketQualityScore]]:
+        """
+        Get all active markets with their quality scores.
+        
+        Returns:
+            List of (market, quality_score) tuples sorted by quality
+        """
+        markets = await self.find_btc_15min_markets()
+        
+        scored = [(m, self.assess_market_quality(m)) for m in markets]
+        scored.sort(key=lambda x: x[1].total_score, reverse=True)
+        
+        return scored
+    
+    async def get_market_prices(self, token_ids: list[str]) -> dict[str, float]:
+        """
+        Get current prices for market tokens from CLOB API.
+        
+        API: GET https://clob.polymarket.com/price?token_id={token_id}&side=buy
+        
+        Args:
+            token_ids: List of clobTokenIds (YES/NO tokens)
+            
+        Returns:
+            Dict mapping token_id to current price
+        """
+        prices = {}
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        async with httpx.AsyncClient(verify=ssl_context, timeout=10.0) as client:
+            for token_id in token_ids:
+                try:
+                    response = await client.get(
+                        f"{self.CLOB_API_URL}/price",
+                        params={"token_id": token_id, "side": "buy"},
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        prices[token_id] = float(data.get("price", 0))
+                except Exception as e:
+                    self.logger.debug("Price fetch failed", token_id=token_id[:20], error=str(e))
+        
+        return prices
+    
+    async def get_orderbook(self, token_id: str) -> Optional[dict]:
+        """
+        Get full orderbook for a token from CLOB API.
+        
+        API: GET https://clob.polymarket.com/book?token_id={token_id}
+        
+        Args:
+            token_id: The clobTokenId (YES or NO token)
+            
+        Returns:
+            Orderbook dict with 'bids' and 'asks' lists, or None on error.
+            Each level: {'price': float, 'size': float}
+        """
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        try:
+            async with httpx.AsyncClient(verify=ssl_context, timeout=10.0) as client:
+                response = await client.get(
+                    f"{self.CLOB_API_URL}/book",
+                    params={"token_id": token_id},
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Parse bids/asks
+                    bids = [
+                        {"price": float(b.get("price", 0)), "size": float(b.get("size", 0))}
+                        for b in data.get("bids", [])
+                    ]
+                    asks = [
+                        {"price": float(a.get("price", 0)), "size": float(a.get("size", 0))}
+                        for a in data.get("asks", [])
+                    ]
+                    
+                    return {
+                        "token_id": token_id,
+                        "bids": bids,
+                        "asks": asks,
+                        "best_bid": bids[0]["price"] if bids else 0,
+                        "best_ask": asks[0]["price"] if asks else 0,
+                        "spread": (asks[0]["price"] - bids[0]["price"]) if (bids and asks) else 0,
+                    }
+                    
+        except Exception as e:
+            self.logger.debug("Orderbook fetch failed", token_id=token_id[:20], error=str(e))
+        
+        return None
 
 
 @dataclass
@@ -98,26 +721,41 @@ class OrderbookSide:
 
 class PolymarketFeed:
     """
-    Polymarket CLOB WebSocket feed for orderbook data.
+    Polymarket CLOB feed for orderbook data.
     
-    Monitors YES and NO token orderbooks for prediction markets.
-    Reference: https://docs.polymarket.com/#websocket-api
+    Uses REST API polling for reliable orderbook updates.
+    Auto-discovers BTC 15-minute markets and refreshes when they expire.
     """
+    
+    CLOB_API_URL = "https://clob.polymarket.com"
+    GAMMA_API_URL = "https://gamma-api.polymarket.com"
     
     def __init__(
         self,
-        market_id: str,
+        market_id: Optional[str] = None,
         ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-        snapshot_interval: float = 0.5,  # 500ms snapshots
+        snapshot_interval: float = 2.0,  # 2 second polling interval (reduce CPU)
+        auto_discover: bool = True,
+        asset: str = "BTC",  # Asset to trade (BTC, ETH, SOL, XRP)
     ):
         self.market_id = market_id
         self.ws_url = ws_url
         self.snapshot_interval = snapshot_interval
+        self.auto_discover = auto_discover
+        self.asset = asset.upper()
+        self._discovery = MarketDiscovery(asset=self.asset)
+        self._discovered_market: Optional[DiscoveredMarket] = None
         
-        self.logger = logger.bind(feed="polymarket", market_id=market_id)
+        # Token IDs for YES/NO outcomes
+        self._yes_token_id: Optional[str] = None
+        self._no_token_id: Optional[str] = None
+        
+        # HTTP client for REST polling
+        self._http_client: Optional[httpx.AsyncClient] = None
+        
+        self.logger = logger.bind(feed="polymarket", asset=self.asset, market_id=market_id or "auto")
         
         # Connection state
-        self._ws = None
         self._running = False
         self.health = FeedHealth()
         
@@ -135,6 +773,14 @@ class PolymarketFeed:
         
         # Last snapshot timestamp
         self._last_snapshot_ms: int = 0
+        
+        # NEW: Price change tracking for divergence strategy
+        # Track when prices last changed (for PM staleness detection)
+        self._last_yes_bid: float = 0.0
+        self._last_yes_ask: float = 0.0
+        self._last_no_bid: float = 0.0
+        self._last_no_ask: float = 0.0
+        self._last_price_change_ms: int = 0  # When any price last changed
     
     def add_callback(self, callback: Callable[[PolymarketData], None]) -> None:
         """Register a callback for orderbook updates."""
@@ -149,15 +795,21 @@ class PolymarketFeed:
                 self.logger.error("Callback error", error=str(e))
     
     async def _connect(self) -> bool:
-        """Establish WebSocket connection."""
+        """Initialize HTTP client and fetch token IDs."""
         try:
-            self._ws = await websockets.connect(
-                self.ws_url,
-                ping_interval=20,
-                ping_timeout=10,
-            )
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            self._http_client = httpx.AsyncClient(verify=ssl_context, timeout=15.0)
+            
+            # Fetch market data to get token IDs
+            if not await self._fetch_token_ids():
+                return False
+            
             self.health.connected = True
-            self.logger.info("Connected to Polymarket WebSocket")
+            self.logger.info(
+                "Connected to Polymarket REST API",
+                yes_token=self._yes_token_id[:20] + "..." if self._yes_token_id else None,
+                no_token=self._no_token_id[:20] + "..." if self._no_token_id else None,
+            )
             return True
         except Exception as e:
             self.health.connected = False
@@ -165,28 +817,69 @@ class PolymarketFeed:
             self.logger.error("Connection failed", error=str(e))
             return False
     
+    async def _fetch_token_ids(self) -> bool:
+        """Fetch clobTokenIds for the market."""
+        try:
+            # First check if we already have tokens from discovery
+            if self._discovered_market and self._discovered_market.tokens:
+                tokens = self._discovered_market.tokens
+                # Parse if it's a JSON string
+                if isinstance(tokens, str):
+                    tokens = json.loads(tokens)
+                if len(tokens) >= 2:
+                    self._yes_token_id = tokens[0] if isinstance(tokens[0], str) else tokens[0].get("token_id")
+                    self._no_token_id = tokens[1] if isinstance(tokens[1], str) else tokens[1].get("token_id")
+                    return True
+            
+            # Use CLOB API directly - more reliable
+            response = await self._http_client.get(
+                f"{self.CLOB_API_URL}/markets/{self.market_id}",
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # CLOB API returns tokens array with token_id and outcome
+                tokens = data.get("tokens", [])
+                if len(tokens) >= 2:
+                    # Find YES and NO/Down tokens by outcome
+                    for token in tokens:
+                        outcome = token.get("outcome", "").lower()
+                        token_id = token.get("token_id", "")
+                        if outcome in ("yes", "up"):
+                            self._yes_token_id = token_id
+                        elif outcome in ("no", "down"):
+                            self._no_token_id = token_id
+                    
+                    if self._yes_token_id and self._no_token_id:
+                        return True
+            
+            self.logger.error("Could not find token IDs for market")
+            return False
+            
+        except Exception as e:
+            self.logger.error("Failed to fetch token IDs", error=str(e))
+            return False
+    
     async def _subscribe(self) -> None:
-        """Subscribe to market orderbook."""
-        # Polymarket subscription format
-        subscribe_msg = {
-            "type": "subscribe",
-            "channel": "market",
-            "market": self.market_id,
-        }
-        
-        await self._ws.send(json.dumps(subscribe_msg))
-        self.logger.info("Sent subscription request")
+        """No subscription needed for REST polling."""
+        pass
     
     def _parse_orderbook_update(self, data: dict) -> None:
         """Parse orderbook update message."""
         try:
+            # Log message type for debugging
+            msg_type = data.get("type", "unknown")
+            self.logger.debug("Parsing orderbook update", type=msg_type, keys=list(data.keys())[:5])
+            
             # Handle different message formats based on Polymarket API
+            # Direct bids/asks (for single-token markets)
             if "bids" in data:
                 self._update_side(self._yes_bids, data["bids"], is_bid=True)
             if "asks" in data:
                 self._update_side(self._yes_asks, data["asks"], is_bid=False)
             
-            # Some markets have separate YES/NO structures
+            # Separate YES/NO structures (for conditional markets)
             if "yes" in data:
                 yes_data = data["yes"]
                 if "bids" in yes_data:
@@ -200,9 +893,24 @@ class PolymarketFeed:
                     self._update_side(self._no_bids, no_data["bids"], is_bid=True)
                 if "asks" in no_data:
                     self._update_side(self._no_asks, no_data["asks"], is_bid=False)
+            
+            # Handle Polymarket CLOB format (outcomes array)
+            if "outcomes" in data:
+                for outcome in data["outcomes"]:
+                    outcome_id = outcome.get("outcome", "").upper()
+                    if "YES" in outcome_id or outcome_id == "1":
+                        if "bids" in outcome:
+                            self._update_side(self._yes_bids, outcome["bids"], is_bid=True)
+                        if "asks" in outcome:
+                            self._update_side(self._yes_asks, outcome["asks"], is_bid=False)
+                    elif "NO" in outcome_id or outcome_id == "0":
+                        if "bids" in outcome:
+                            self._update_side(self._no_bids, outcome["bids"], is_bid=True)
+                        if "asks" in outcome:
+                            self._update_side(self._no_asks, outcome["asks"], is_bid=False)
                     
         except Exception as e:
-            self.logger.error("Error parsing orderbook", error=str(e))
+            self.logger.error("Error parsing orderbook", error=str(e), data_keys=list(data.keys())[:10] if isinstance(data, dict) else "not_dict")
     
     def _update_side(self, side: OrderbookSide, updates: list, is_bid: bool) -> None:
         """Update one side of the orderbook."""
@@ -237,6 +945,35 @@ class PolymarketFeed:
         interval_ms = int(self.snapshot_interval * 1000)
         return now_ms - self._last_snapshot_ms >= interval_ms
     
+    def _calculate_orderbook_imbalance(self) -> tuple[float, float, float]:
+        """
+        Calculate proper orderbook imbalance between YES and NO sides.
+        
+        Returns:
+            (imbalance_ratio, yes_depth_total, no_depth_total)
+            
+        imbalance_ratio interpretation:
+        - Positive (>0): YES-heavy (more YES liquidity)
+        - Negative (<0): NO-heavy (more NO liquidity)
+        - Zero: Balanced
+        
+        Range: -1.0 to +1.0
+        """
+        # Sum liquidity across top 5 levels for each side
+        yes_depth = sum(level.size for level in self._yes_bids.levels[:5])
+        no_depth = sum(level.size for level in self._no_bids.levels[:5])
+        
+        total_depth = yes_depth + no_depth
+        
+        if total_depth == 0:
+            return 0.0, 0.0, 0.0
+        
+        # Normalized imbalance: (YES - NO) / (YES + NO)
+        # Result is between -1 (all NO) and +1 (all YES)
+        imbalance = (yes_depth - no_depth) / total_depth
+        
+        return imbalance, yes_depth, no_depth
+    
     def _create_snapshot(self) -> PolymarketData:
         """Create a snapshot of current orderbook state."""
         now_ms = int(time.time() * 1000)
@@ -246,29 +983,59 @@ class PolymarketFeed:
         yes_liq_60s, no_liq_60s = self._liquidity_tracker.get_liquidity_at(60)
         
         # Current liquidity
-        current_yes_liq = self._yes_bids.best_size
-        current_no_liq = self._no_bids.best_size
+        current_yes_liq = self._yes_bids.best_size if self._yes_bids.levels else 0.0
+        current_no_liq = self._no_bids.best_size if self._no_bids.levels else 0.0
         
         # Add to liquidity tracker
         self._liquidity_tracker.add_snapshot(current_yes_liq, current_no_liq)
         
         # Calculate spread
-        yes_bid = self._yes_bids.best_price
-        yes_ask = self._yes_asks.best_price
+        yes_bid = self._yes_bids.best_price if self._yes_bids.levels else 0.0
+        yes_ask = self._yes_asks.best_price if self._yes_asks.levels else 0.0
         spread = yes_ask - yes_bid if yes_ask > 0 and yes_bid > 0 else 0.0
         
         # Calculate implied probability (mid price)
-        implied_prob = (yes_bid + yes_ask) / 2 if yes_bid > 0 and yes_ask > 0 else 0.5
+        if yes_bid > 0 and yes_ask > 0:
+            implied_prob = (yes_bid + yes_ask) / 2
+        elif yes_bid > 0:
+            implied_prob = yes_bid
+        elif yes_ask > 0:
+            implied_prob = yes_ask
+        else:
+            implied_prob = 0.5  # Default if no data
         
         # Check for liquidity collapse
         liquidity_collapsing = False
         if yes_liq_30s > 0:
             liquidity_collapsing = current_yes_liq < 0.6 * yes_liq_30s
         
-        # Calculate orderbook imbalance
-        total_yes_depth = self._yes_bids.total_depth + self._yes_asks.total_depth
-        total_no_depth = self._no_bids.total_depth + self._no_asks.total_depth
-        imbalance_ratio = total_yes_depth / total_no_depth if total_no_depth > 0 else 1.0
+        # Calculate proper orderbook imbalance (YES vs NO depth)
+        # Positive = YES-heavy, Negative = NO-heavy
+        imbalance_ratio, yes_depth_total, no_depth_total = self._calculate_orderbook_imbalance()
+        
+        # Get current NO prices
+        no_bid = self._no_bids.best_price if self._no_bids.levels else 0.0
+        no_ask = self._no_asks.best_price if self._no_asks.levels else 0.0
+        
+        # ====================================================================
+        # NEW: Track when prices change (for PM staleness / divergence signal)
+        # ====================================================================
+        price_changed = (
+            abs(yes_bid - self._last_yes_bid) > 0.001 or
+            abs(yes_ask - self._last_yes_ask) > 0.001 or
+            abs(no_bid - self._last_no_bid) > 0.001 or
+            abs(no_ask - self._last_no_ask) > 0.001
+        )
+        
+        if price_changed or self._last_price_change_ms == 0:
+            self._last_price_change_ms = now_ms
+            self._last_yes_bid = yes_bid
+            self._last_yes_ask = yes_ask
+            self._last_no_bid = no_bid
+            self._last_no_ask = no_ask
+        
+        # Calculate orderbook age (seconds since last price change)
+        orderbook_age_seconds = (now_ms - self._last_price_change_ms) / 1000.0
         
         self._last_snapshot_ms = now_ms
         
@@ -279,8 +1046,8 @@ class PolymarketFeed:
             yes_ask=yes_ask,
             yes_liquidity_best=current_yes_liq,
             yes_depth_3=[OrderbookLevel(l.price, l.size) for l in self._yes_bids.levels[:3]],
-            no_bid=self._no_bids.best_price,
-            no_ask=self._no_asks.best_price,
+            no_bid=no_bid,
+            no_ask=no_ask,
             no_liquidity_best=current_no_liq,
             no_depth_3=[OrderbookLevel(l.price, l.size) for l in self._no_bids.levels[:3]],
             spread=spread,
@@ -289,110 +1056,371 @@ class PolymarketFeed:
             liquidity_60s_ago=yes_liq_60s,
             liquidity_collapsing=liquidity_collapsing,
             orderbook_imbalance_ratio=imbalance_ratio,
+            yes_depth_total=yes_depth_total,
+            no_depth_total=no_depth_total,
+            # NEW: Staleness tracking for divergence strategy
+            last_price_change_ms=self._last_price_change_ms,
+            orderbook_age_seconds=orderbook_age_seconds,
         )
     
-    async def _handle_message(self, message: str) -> None:
-        """Process incoming WebSocket message."""
+    async def _poll_orderbook(self) -> bool:
+        """Poll REST API for orderbook data."""
         try:
-            data = json.loads(message)
+            if not self._http_client or not self._yes_token_id:
+                return False
             
-            msg_type = data.get("type", "")
+            # Always update timestamp at start of poll to avoid stale warnings
+            self.health.last_message_ms = int(time.time() * 1000)
             
-            # Handle subscription confirmation
-            if msg_type == "subscribed":
-                self.logger.info("Subscription confirmed")
-                return
+            # Fetch YES and NO orderbooks concurrently
+            yes_response, no_response = await asyncio.gather(
+                self._http_client.get(
+                    f"{self.CLOB_API_URL}/book",
+                    params={"token_id": self._yes_token_id},
+                ),
+                self._http_client.get(
+                    f"{self.CLOB_API_URL}/book",
+                    params={"token_id": self._no_token_id},
+                ),
+            )
             
-            # Handle errors
-            if msg_type == "error":
-                self.logger.error("Polymarket error", error=data.get("message"))
-                return
+            if yes_response.status_code == 200:
+                yes_book = yes_response.json()
+                self._update_side(self._yes_bids, yes_book.get("bids", []), is_bid=True)
+                self._update_side(self._yes_asks, yes_book.get("asks", []), is_bid=False)
             
-            # Handle orderbook updates
-            if msg_type in ["snapshot", "update", "book"]:
-                self._parse_orderbook_update(data)
-                
-                # Create snapshot at regular intervals
-                if self._should_snapshot():
-                    snapshot = self._create_snapshot()
-                    self._notify_callbacks(snapshot)
+            if no_response.status_code == 200:
+                no_book = no_response.json()
+                self._update_side(self._no_bids, no_book.get("bids", []), is_bid=True)
+                self._update_side(self._no_asks, no_book.get("asks", []), is_bid=False)
             
-            # Handle trade events (for additional context)
-            if msg_type == "trade":
-                # Could track recent trades for additional signals
-                pass
-                
-        except json.JSONDecodeError as e:
-            self.logger.error("JSON decode error", error=str(e))
+            return True
+            
         except Exception as e:
-            self.logger.error("Error handling message", error=str(e))
+            self.logger.debug("Orderbook poll failed", error=str(e))
+            return False
     
-    async def _receive_loop(self) -> None:
-        """Main message receive loop."""
+    async def _poll_loop(self) -> None:
+        """Main polling loop for REST API."""
+        self.logger.info("Poll loop started")
+        poll_count = 0
+        
         while self._running:
             try:
-                if not self._ws or not self._ws.open:
+                # Always update heartbeat
+                self.health.last_message_ms = int(time.time() * 1000)
+                
+                if not self._http_client:
                     if not await self._connect():
                         await asyncio.sleep(1)
                         continue
-                    await self._subscribe()
                 
-                message = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=30.0
-                )
+                # Poll orderbook
+                success = await self._poll_orderbook()
+                poll_count += 1
                 
-                self.health.last_message_ms = int(time.time() * 1000)
-                await self._handle_message(message)
+                # Log progress every 30 polls (30 seconds at 1s interval)
+                if poll_count % 30 == 0:
+                    self.logger.debug(
+                        "Poll progress",
+                        polls=poll_count,
+                        has_data=self.has_orderbook_data(),
+                        yes_bid=self._yes_bids.best_price if self._yes_bids.levels else 0,
+                    )
                 
-            except asyncio.TimeoutError:
-                self.logger.warning("Receive timeout")
-            except ConnectionClosed as e:
-                self.logger.warning("Connection closed", code=e.code)
-                self.health.connected = False
+                if success:
+                    # Create snapshot
+                    if self._should_snapshot():
+                        snapshot = self._create_snapshot()
+                        if snapshot:
+                            self._notify_callbacks(snapshot)
+                
+                # Wait for next poll interval
+                await asyncio.sleep(self.snapshot_interval)
+                
+            except asyncio.CancelledError:
+                self.logger.info("Poll loop cancelled")
+                break
             except Exception as e:
-                self.logger.error("Receive error", error=str(e))
+                self.logger.error("Poll error", error=str(e))
                 self.health.error_count += 1
                 await asyncio.sleep(1)
+    
+    async def _discover_market(self, force: bool = False) -> bool:
+        """
+        Discover and set the market ID.
+        
+        Args:
+            force: If True, re-discover even if market_id is set
+        """
+        if self.market_id and not force:
+            return True
+        
+        if not self.auto_discover and not force:
+            self.logger.error("No market_id provided and auto_discover is disabled")
+            return False
+        
+        self.logger.info("Discovering BTC 15-minute market...")
+        
+        try:
+            market = await self._discovery.get_current_market()
+            
+            if market:
+                old_market_id = self.market_id
+                self.market_id = market.condition_id
+                self._discovered_market = market
+                self.logger = logger.bind(
+                    feed="polymarket", 
+                    market_id=self.market_id[:30] + "..." if len(self.market_id) > 30 else self.market_id,
+                    outcome=market.outcome,
+                )
+                
+                # Clear orderbook if switching markets
+                if old_market_id and old_market_id != self.market_id:
+                    self._clear_orderbook()
+                    self.logger.info(
+                        "Switched to new market",
+                        old=old_market_id[:30] if old_market_id else None,
+                        new=self.market_id[:30],
+                        question=market.question[:60],
+                    )
+                else:
+                    self.logger.info(
+                        "Discovered market",
+                        question=market.question[:60],
+                        outcome=market.outcome,
+                    )
+                return True
+            else:
+                self.logger.warning("No BTC 15-minute markets found - will retry")
+                return False
+                
+        except Exception as e:
+            self.logger.error("Market discovery failed", error=str(e))
+            return False
+    
+    def _clear_orderbook(self) -> None:
+        """Clear orderbook data when switching markets."""
+        self._yes_bids = OrderbookSide()
+        self._yes_asks = OrderbookSide()
+        self._no_bids = OrderbookSide()
+        self._no_asks = OrderbookSide()
+        self._liquidity_tracker = LiquidityTracker()
+        self._last_snapshot_ms = 0
+    
+    async def _market_refresh_loop(self) -> None:
+        """
+        Background task to refresh market when current one expires.
+        
+        Checks every 30 seconds if market needs to be refreshed.
+        Auto-discovers new market 60 seconds before current window ends.
+        """
+        # Wait for initial discovery
+        await asyncio.sleep(5)
+        
+        while self._running:
+            try:
+                # Calculate time until next 15-min window
+                now = int(time.time())
+                current_window_end = ((now // 900) + 1) * 900
+                time_until_end = current_window_end - now
+                
+                # If less than 60 seconds until end, start looking for next market
+                if time_until_end < 60:
+                    self.logger.info(
+                        "Market window ending soon, preparing to refresh",
+                        seconds_remaining=time_until_end,
+                    )
+                    
+                    # Wait for window to end
+                    await asyncio.sleep(time_until_end + 5)
+                    
+                    # Discover new market
+                    if await self._discover_market(force=True):
+                        # Reconnect with new token IDs
+                        if not await self._fetch_token_ids():
+                            self.logger.warning("Failed to fetch new token IDs")
+                        else:
+                            self.logger.info("Connected to new market")
+                    else:
+                        self.logger.warning("Failed to discover new market, will retry")
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Market refresh error", error=str(e))
+                await asyncio.sleep(30)
     
     async def start(self) -> None:
         """Start the Polymarket feed."""
         self._running = True
-        self.logger.info("Starting Polymarket feed")
+        self.logger.info("Starting Polymarket feed (REST polling mode)")
         
-        if await self._connect():
-            await self._subscribe()
+        # Discover market if needed
+        if not await self._discover_market():
+            self.logger.error("Cannot start - no market ID")
+            return
         
-        await self._receive_loop()
+        # Connect and fetch token IDs
+        if not await self._connect():
+            self.logger.error("Cannot start - connection failed")
+            return
+        
+        # Run poll loop and market refresh loop concurrently
+        await asyncio.gather(
+            self._poll_loop(),
+            self._market_refresh_loop(),
+            return_exceptions=True,
+        )
     
     async def stop(self) -> None:
         """Stop the feed."""
         self._running = False
-        if self._ws:
+        if self._http_client:
             try:
-                await self._ws.close()
+                await self._http_client.aclose()
             except Exception:
                 pass
+            self._http_client = None
         self.health.connected = False
         self.logger.info("Stopped Polymarket feed")
     
     def get_data(self) -> Optional[PolymarketData]:
         """Get current orderbook snapshot."""
-        if not self._yes_bids.levels:
+        # Always return a snapshot, even if orderbook is empty
+        # This allows the bot to check market availability and connection status
+        try:
+            snapshot = self._create_snapshot()
+            # Only return None if we have no connection and no data
+            if not self.health.connected and not self._yes_bids.levels:
+                return None
+            return snapshot
+        except Exception as e:
+            self.logger.debug("Could not create snapshot", error=str(e))
+            # Return None only if we can't create snapshot at all
             return None
-        return self._create_snapshot()
+    
+    def has_orderbook_data(self) -> bool:
+        """Check if we have any orderbook data."""
+        return (
+            len(self._yes_bids.levels) > 0 or
+            len(self._yes_asks.levels) > 0 or
+            len(self._no_bids.levels) > 0 or
+            len(self._no_asks.levels) > 0
+        )
     
     def get_metrics(self) -> dict:
         """Get feed health metrics."""
         return {
             "name": "polymarket",
-            "market_id": self.market_id,
+            "market_id": self.market_id[:30] + "..." if self.market_id and len(self.market_id) > 30 else self.market_id,
             "connected": self.health.connected,
             "is_stale": self.health.is_stale,
             "age_ms": self.health.age_ms,
             "error_count": self.health.error_count,
-            "yes_bid": self._yes_bids.best_price,
-            "yes_ask": self._yes_asks.best_price,
-            "spread": self._yes_asks.best_price - self._yes_bids.best_price if self._yes_asks.levels and self._yes_bids.levels else 0,
+            "has_orderbook_data": self.has_orderbook_data(),
+            "yes_bid": self._yes_bids.best_price if self._yes_bids.levels else 0,
+            "yes_ask": self._yes_asks.best_price if self._yes_asks.levels else 0,
+            "spread": (self._yes_asks.best_price - self._yes_bids.best_price) if (self._yes_asks.levels and self._yes_bids.levels) else 0,
+            "discovered_market": self._discovered_market.question[:50] if self._discovered_market else None,
+            "market_outcome": self._discovered_market.outcome if self._discovered_market else None,
         }
+    
+    def get_discovered_market(self) -> Optional[DiscoveredMarket]:
+        """Get the discovered market info."""
+        return self._discovered_market
+    
+    async def get_live_orderbook(self, market_id: Optional[str] = None) -> dict:
+        """
+        Get FRESH orderbook snapshot (not cached) for pre-trade slippage simulation.
+        
+        Args:
+            market_id: Optional market ID (uses current if not specified)
+            
+        Returns:
+            Dict with 'bids' and 'asks' lists
+        """
+        target_market = market_id or self.market_id
+        if not target_market or not self._http_client:
+            return {'bids': [], 'asks': []}
+        
+        try:
+            # Fetch fresh orderbook directly
+            response = await self._http_client.get(
+                f"{self.CLOB_API_URL}/book",
+                params={"token_id": self._yes_token_id},
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'bids': data.get('bids', []),
+                    'asks': data.get('asks', [])
+                }
+        except Exception as e:
+            self.logger.debug("Live orderbook fetch failed", error=str(e))
+        
+        return {'bids': [], 'asks': []}
+    
+    def simulate_fill(self, side: str, size_eur: float) -> dict:
+        """
+        Simulate order fill using current orderbook state.
+        
+        Args:
+            side: 'YES' or 'NO'
+            size_eur: Position size in EUR
+            
+        Returns:
+            Dict with fill simulation results
+        """
+        levels = self._yes_bids.levels if side.upper() == 'YES' else self._no_bids.levels
+        
+        if not levels:
+            return {
+                'avg_price': 0.0,
+                'filled_shares': 0.0,
+                'unfilled_size': size_eur,
+                'slippage': 1.0,
+                'can_fill': False,
+            }
+        
+        remaining_eur = size_eur
+        filled_shares = 0.0
+        total_cost = 0.0
+        entry_price = levels[0].price
+        
+        for level in levels:
+            if remaining_eur <= 0:
+                break
+            
+            level_price = level.price
+            level_size_eur = level.size * level_price  # Convert shares to EUR value
+            
+            fill_eur = min(remaining_eur, level_size_eur)
+            fill_shares = fill_eur / level_price if level_price > 0 else 0
+            
+            filled_shares += fill_shares
+            total_cost += fill_eur
+            remaining_eur -= fill_eur
+        
+        avg_price = total_cost / filled_shares if filled_shares > 0 else 0
+        slippage = abs(avg_price - entry_price) / entry_price if entry_price > 0 else 1.0
+        
+        return {
+            'avg_price': avg_price,
+            'filled_shares': filled_shares,
+            'unfilled_size': remaining_eur,
+            'slippage': slippage,
+            'can_fill': remaining_eur < 0.1 * size_eur,  # Can fill if <10% unfilled
+        }
+    
+    def get_market_quality_score(self) -> float:
+        """Get quality score for current market."""
+        if not self._discovered_market:
+            return 0.0
+        
+        quality = self._discovery.assess_market_quality(self._discovered_market)
+        return quality.total_score
 

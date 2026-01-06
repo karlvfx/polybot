@@ -4,12 +4,14 @@ Provides common functionality for all data feeds.
 """
 
 import asyncio
+import ssl
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import certifi
 import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -29,11 +31,11 @@ class FeedHealth:
     
     @property
     def is_stale(self) -> bool:
-        """Check if feed data is stale (>3 seconds old)."""
+        """Check if feed data is stale (>30 seconds old)."""
         if self.last_message_ms == 0:
             return True
         age_ms = int(time.time() * 1000) - self.last_message_ms
-        return age_ms > 3000
+        return age_ms > 30000  # 30 seconds (increased from 10s for low-volume periods)
     
     @property
     def age_ms(self) -> int:
@@ -115,6 +117,20 @@ class PriceBuffer:
         """Get total volume over window."""
         _, _, volumes = self.get_window(seconds)
         return sum(volumes)
+    
+    def get_volume_avg(self, seconds: float) -> float:
+        """Get average volume rate over window (volume per second)."""
+        prices, timestamps, volumes = self.get_window(seconds)
+        if len(timestamps) < 2:
+            return 0.0
+        
+        total_volume = sum(volumes)
+        time_span_s = (timestamps[-1] - timestamps[0]) / 1000.0
+        
+        if time_span_s <= 0:
+            return 0.0
+        
+        return total_volume / time_span_s
     
     def get_atr(self, seconds: float, period_seconds: float = 60) -> float:
         """
@@ -247,21 +263,37 @@ class BaseFeed(ABC):
         """Send periodic heartbeat pings."""
         while self._running:
             try:
-                if self._ws and self._ws.open:
-                    await self._ws.ping()
-                    self.health.last_heartbeat_ms = int(time.time() * 1000)
+                if self._ws:
+                    # Check if connection is still open (websockets API changed)
+                    try:
+                        await self._ws.ping()
+                        self.health.last_heartbeat_ms = int(time.time() * 1000)
+                    except (ConnectionClosed, AttributeError, Exception):
+                        # Connection closed or invalid - don't log, just skip
+                        # Connection will be re-established by receive loop
+                        pass
                 await asyncio.sleep(self.heartbeat_interval)
-            except Exception as e:
-                self.logger.warning("Heartbeat failed", error=str(e))
+            except asyncio.CancelledError:
+                # Normal shutdown
+                break
+            except Exception:
+                # Silently continue - heartbeat errors are not critical
+                pass
     
     async def _connect(self) -> bool:
         """Establish WebSocket connection."""
         try:
+            # Create SSL context with certifi certificates for wss:// connections
+            ssl_context = None
+            if self.ws_url.startswith('wss://'):
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+            
             self._ws = await websockets.connect(
                 self.ws_url,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5,
+                ssl=ssl_context,
             )
             self.health.connected = True
             self.logger.info("Connected to WebSocket")
@@ -290,33 +322,60 @@ class BaseFeed(ABC):
         """Main loop for receiving messages."""
         while self._running:
             try:
-                if not self._ws or not self._ws.open:
+                if not self._ws:
                     await self._reconnect()
                     continue
                 
-                message = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=30.0
-                )
+                # Check if connection is still valid by trying to receive
+                # Use longer timeout (60s) since exchange feeds may have quiet periods
+                try:
+                    message = await asyncio.wait_for(
+                        self._ws.recv(),
+                        timeout=60.0
+                    )
+                    
+                    receive_time = int(time.time() * 1000)
+                    self.health.last_message_ms = receive_time
+                    
+                    await self._handle_message(message)
+                except (ConnectionClosed, AttributeError) as e:
+                    # Connection closed, reconnect
+                    self.logger.debug("Connection lost, will reconnect", error=type(e).__name__)
+                    self.health.connected = False
+                    self._ws = None  # Clear the stale connection
+                    if self._running:
+                        await self._reconnect()
+                    continue
                 
-                receive_time = int(time.time() * 1000)
-                self.health.last_message_ms = receive_time
-                
-                await self._handle_message(message)
+            except asyncio.CancelledError:
+                self.logger.info("Receive loop cancelled")
+                break
                 
             except asyncio.TimeoutError:
-                self.logger.warning("Receive timeout, checking connection")
-                if self._ws and self._ws.open:
-                    continue
-                self.health.connected = False
+                # 60s timeout - check if connection is still alive via ping
+                if self._ws and self._running:
+                    try:
+                        await self._ws.ping()
+                        # Ping succeeded, connection is still alive, just no data
+                        self.logger.debug("No data for 60s but connection alive")
+                        continue
+                    except Exception:
+                        # Ping failed, reconnect
+                        self.logger.warning("Connection appears dead, reconnecting")
+                        self.health.connected = False
+                        self._ws = None
+                        await self._reconnect()
+                continue
                 
             except ConnectionClosed as e:
                 self.logger.warning("Connection closed", code=e.code, reason=e.reason)
                 self.health.connected = False
+                self._ws = None
                 
             except WebSocketException as e:
                 self.logger.error("WebSocket error", error=str(e))
                 self.health.connected = False
+                self._ws = None
                 self.health.error_count += 1
                 
             except Exception as e:
@@ -327,17 +386,24 @@ class BaseFeed(ABC):
     async def start(self) -> None:
         """Start the feed."""
         self._running = True
+        self._tasks = []
         self.logger.info("Starting feed")
         
         # Initial connection
         if not await self._connect():
-            await self._reconnect()
+            if self._running:
+                await self._reconnect()
         
         # Start receive loop and heartbeat
-        await asyncio.gather(
-            self._receive_loop(),
-            self._heartbeat(),
-        )
+        self._tasks = [
+            asyncio.create_task(self._receive_loop()),
+            asyncio.create_task(self._heartbeat()),
+        ]
+        
+        try:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            self.logger.info("Feed cancelled")
     
     async def stop(self) -> None:
         """Stop the feed gracefully."""
@@ -347,7 +413,7 @@ class BaseFeed(ABC):
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
+            except (ConnectionClosed, AttributeError, Exception):
                 pass
         
         self.health.connected = False

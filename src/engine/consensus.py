@@ -90,15 +90,15 @@ class ConsensusEngine:
         return metrics
     
     def _check_staleness(self, metrics: list[ExchangeMetrics]) -> list[ExchangeMetrics]:
-        """Filter out stale metrics (>3s old)."""
+        """Filter out stale metrics (>10s old)."""
         now_ms = int(time.time() * 1000)
         fresh = []
         for m in metrics:
             age_ms = now_ms - m.local_timestamp_ms
-            if age_ms < 3000:
+            if age_ms < 10000:  # 10 seconds - more reasonable threshold
                 fresh.append(m)
             else:
-                self.logger.warning(
+                self.logger.debug(  # Changed to debug to reduce noise
                     "Stale exchange data",
                     exchange=m.exchange,
                     age_ms=age_ms,
@@ -193,7 +193,7 @@ class ConsensusEngine:
         # Filter stale data
         fresh_metrics = self._check_staleness(all_metrics)
         if len(fresh_metrics) < 2:
-            self.logger.warning("Too many stale exchanges")
+            self.logger.debug("Too many stale exchanges, waiting for fresh data")
             return None
         
         # Calculate price deviation
@@ -202,6 +202,15 @@ class ConsensusEngine:
         
         # Determine consensus price
         tolerance = settings.signals.consensus_price_tolerance
+        
+        # Calculate agreement_score (1.0 = perfect agreement, decreases with deviation)
+        # At tolerance level, agreement_score = 0.85
+        # At 2x tolerance, agreement_score ≈ 0.70
+        if max_deviation > 0:
+            agreement_score = 1.0 - (max_deviation / (2 * tolerance))
+            agreement_score = max(0.0, min(1.0, agreement_score))
+        else:
+            agreement_score = 1.0
         
         if max_deviation <= tolerance:
             # All prices agree - use weighted average
@@ -220,6 +229,7 @@ class ConsensusEngine:
                 "Consensus failure - high deviation",
                 max_deviation=max_deviation,
                 prices=prices,
+                agreement_score=agreement_score,
             )
             return None
         
@@ -236,10 +246,18 @@ class ConsensusEngine:
         # Calculate spike concentration
         spike_concentration = max_10s_move / abs(move_30s) if move_30s != 0 else 0.0
         
-        # Volume metrics
+        # Volume metrics - use exchange-level averages for better accuracy
         total_volume = sum(m.volume_1m for m in fresh_metrics)
-        self._update_volume_history(total_volume)
-        avg_volume_5m = self._get_avg_volume_5m()
+        
+        # Get average from exchange-level 5-minute averages
+        exchange_avg_volumes = [m.volume_5m_avg for m in fresh_metrics if m.volume_5m_avg > 0]
+        if exchange_avg_volumes:
+            avg_volume_5m = sum(exchange_avg_volumes)
+        else:
+            # Fallback to internal history tracking
+            self._update_volume_history(total_volume)
+            avg_volume_5m = self._get_avg_volume_5m()
+        
         volume_surge = total_volume / avg_volume_5m if avg_volume_5m > 0 else 1.0
         
         # Determine volatility regime
@@ -264,6 +282,8 @@ class ConsensusEngine:
             volume_surge_ratio=volume_surge,
             agreement=agreement,
             max_deviation_pct=max_deviation,
+            agreement_score=agreement_score,
+            exchange_count=len(fresh_metrics),
         )
         
         self._current_consensus = consensus

@@ -2,16 +2,28 @@
 Coinbase Exchange WebSocket feed for BTC/USD real-time price data.
 """
 
+import asyncio
 import json
 import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import structlog
+from websockets.exceptions import ConnectionClosed
 
 from src.feeds.base import BaseFeed
 from src.models.schemas import ExchangeTick, ExchangeMetrics
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class VolumeEntry:
+    """Volume entry for rolling window."""
+    timestamp_ms: int
+    volume: float
 
 
 class CoinbaseFeed(BaseFeed):
@@ -34,8 +46,11 @@ class CoinbaseFeed(BaseFeed):
             ws_url=ws_url,
         )
         
+        # Enhanced volume tracking with rolling 5-minute buffer
+        self._volume_buffer: deque[VolumeEntry] = deque()
+        self._volume_buffer_max_age_ms = 300_000  # 5 minutes
         self._volume_1m: float = 0.0
-        self._volume_window_start_ms: int = 0
+        self._volume_5m_avg: float = 0.0
     
     async def _subscribe(self) -> None:
         """Subscribe to matches channel."""
@@ -67,7 +82,6 @@ class CoinbaseFeed(BaseFeed):
                 # Parse timestamp (ISO format)
                 time_str = data.get("time", "")
                 if time_str:
-                    from datetime import datetime
                     try:
                         dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
                         trade_time_ms = int(dt.timestamp() * 1000)
@@ -119,14 +133,36 @@ class CoinbaseFeed(BaseFeed):
             self.logger.error("Error handling message", error=str(e))
     
     def _update_volume(self, size: float, timestamp_ms: int) -> None:
-        """Update 1-minute rolling volume."""
-        current_window_start = timestamp_ms - (timestamp_ms % 60000)
+        """Update rolling volume with 1-minute current and 5-minute average."""
+        # Add to rolling buffer
+        self._volume_buffer.append(VolumeEntry(
+            timestamp_ms=timestamp_ms,
+            volume=size,
+        ))
         
-        if current_window_start != self._volume_window_start_ms:
-            self._volume_1m = size
-            self._volume_window_start_ms = current_window_start
+        # Clean up old entries
+        cutoff_ms = timestamp_ms - self._volume_buffer_max_age_ms
+        while self._volume_buffer and self._volume_buffer[0].timestamp_ms < cutoff_ms:
+            self._volume_buffer.popleft()
+        
+        # Calculate 1-minute volume (last 60 seconds)
+        cutoff_1m = timestamp_ms - 60_000
+        self._volume_1m = sum(
+            e.volume for e in self._volume_buffer 
+            if e.timestamp_ms >= cutoff_1m
+        )
+        
+        # Calculate 5-minute average (volume per minute over 5 minutes)
+        if len(self._volume_buffer) >= 2:
+            total_volume = sum(e.volume for e in self._volume_buffer)
+            time_span_ms = self._volume_buffer[-1].timestamp_ms - self._volume_buffer[0].timestamp_ms
+            if time_span_ms > 0:
+                minutes = time_span_ms / 60_000
+                self._volume_5m_avg = total_volume / max(minutes, 1.0)
+            else:
+                self._volume_5m_avg = total_volume
         else:
-            self._volume_1m += size
+            self._volume_5m_avg = self._volume_1m
     
     def get_metrics(self) -> ExchangeMetrics:
         """Get current exchange metrics."""
@@ -142,6 +178,7 @@ class CoinbaseFeed(BaseFeed):
             velocity_30s=self.price_buffer.get_velocity(30),
             volatility_30s=self.price_buffer.get_volatility(30),
             volume_1m=self._volume_1m,
+            volume_5m_avg=self._volume_5m_avg,
             atr_5m=self.price_buffer.get_atr(300, 60),
             max_move_10s_pct=self.price_buffer.get_max_move_in_subwindow(30, 10),
         )

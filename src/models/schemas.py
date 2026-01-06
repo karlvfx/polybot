@@ -98,6 +98,7 @@ class ExchangeMetrics:
     
     # Volume and ATR
     volume_1m: float = 0.0
+    volume_5m_avg: float = 0.0  # Rolling 5-minute average volume
     atr_5m: float = 0.0
     
     # Spike detection
@@ -130,9 +131,13 @@ class ConsensusData:
     avg_volume_5m: float = 0.0
     volume_surge_ratio: float = 0.0
     
-    # Agreement
+    # Agreement - NEW: Added agreement_score (0-1) for exchange agreement quality
     agreement: bool = False
     max_deviation_pct: float = 0.0
+    agreement_score: float = 0.0  # 1.0 = perfect agreement, 0.0 = high deviation
+    
+    # Number of exchanges contributing to consensus
+    exchange_count: int = 0
 
 
 # --- Oracle Data Models ---
@@ -191,7 +196,41 @@ class PolymarketData:
     liquidity_collapsing: bool = False
     
     # Orderbook imbalance
-    orderbook_imbalance_ratio: float = 1.0
+    orderbook_imbalance_ratio: float = 0.0
+    yes_depth_total: float = 0.0
+    no_depth_total: float = 0.0
+    
+    # NEW: Orderbook staleness tracking (for divergence strategy)
+    last_price_change_ms: int = 0  # When YES/NO prices last changed
+    orderbook_age_seconds: float = 0.0  # Seconds since last price change
+    
+    def get_orderbook_age_ms(self) -> int:
+        """Get milliseconds since last orderbook price change."""
+        import time
+        if self.last_price_change_ms == 0:
+            return 0
+        return int(time.time() * 1000) - self.last_price_change_ms
+
+
+@dataclass
+class DivergenceData:
+    """
+    Divergence signal data for spot-PM strategy.
+    
+    The core edge: when spot price moves but PM odds haven't adjusted yet.
+    """
+    spot_implied_prob: float  # Probability implied by spot price momentum
+    pm_implied_prob: float    # Current PM YES price (= UP probability)
+    divergence: float         # Absolute difference between the two
+    pm_orderbook_age_seconds: float  # How long PM odds have been stale
+    
+    # Direction and strength
+    signal_direction: str = ""  # "UP" or "DOWN"
+    is_actionable: bool = False  # Meets minimum thresholds
+    
+    # Thresholds used
+    min_divergence: float = 0.08  # 8% probability difference
+    min_pm_age: float = 8.0  # Seconds of PM staleness required
 
 
 # --- Scoring Models ---
@@ -199,13 +238,20 @@ class PolymarketData:
 @dataclass
 class ConfidenceBreakdown:
     """Breakdown of confidence score components."""
+    # NEW divergence-based weights (primary signal)
+    divergence: float = 0.0         # 40% - Spot-PM divergence magnitude
+    pm_staleness: float = 0.0       # 20% - Orderbook age (stale = opportunity)
+    
+    # Supporting factors
+    consensus_strength: float = 0.0  # 15% - Exchange agreement quality
+    liquidity: float = 0.0           # 10% - Available depth
+    volume_surge: float = 0.0        # 8%  - Volume authentication
+    spike_concentration: float = 0.0 # 7%  - Move quality (spike vs drift)
+    
+    # Legacy (kept for backwards compatibility, weight=0)
     oracle_age: float = 0.0
-    consensus_strength: float = 0.0
     misalignment: float = 0.0
-    liquidity: float = 0.0
     spread_anomaly: float = 0.0
-    volume_surge: float = 0.0
-    spike_concentration: float = 0.0
 
 
 @dataclass
@@ -286,6 +332,8 @@ class SpotDataLog(BaseModel):
     spike_concentration: float
     volume_surge_ratio: float
     agreement: bool
+    agreement_score: float = 0.0  # Exchange agreement quality (0-1)
+    exchange_count: int = 0  # Number of exchanges contributing
 
 
 class OracleDataLog(BaseModel):
@@ -452,6 +500,8 @@ class SignalCandidate:
                 spike_concentration=self.consensus.spike_concentration if self.consensus else 0,
                 volume_surge_ratio=self.consensus.volume_surge_ratio if self.consensus else 0,
                 agreement=self.consensus.agreement if self.consensus else False,
+                agreement_score=self.consensus.agreement_score if self.consensus else 0,
+                exchange_count=self.consensus.exchange_count if self.consensus else 0,
             ),
             oracle_data=OracleDataLog(
                 current_value=self.oracle.current_value if self.oracle else 0,

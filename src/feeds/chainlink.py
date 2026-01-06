@@ -4,11 +4,14 @@ Monitors on-chain oracle updates and calculates oracle age.
 """
 
 import asyncio
+import ssl
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+import aiohttp
+import certifi
 import structlog
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider
@@ -120,7 +123,7 @@ class ChainlinkFeed:
         feed_address: str,
         rpc_url: str,
         ws_url: Optional[str] = None,
-        poll_interval: float = 1.0,
+        poll_interval: float = 2.0,  # 2 second poll (reduce CPU)
     ):
         self.feed_address = feed_address
         self.rpc_url = rpc_url
@@ -150,15 +153,30 @@ class ChainlinkFeed:
     async def _connect(self) -> bool:
         """Connect to Polygon RPC."""
         try:
-            # Use HTTP provider for reliability
-            self._w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(self.rpc_url))
+            # Create SSL context with certifi certificates
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            
+            # Create aiohttp connector with SSL context
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            session = aiohttp.ClientSession(connector=connector)
+            
+            # Use HTTP provider with custom session for SSL
+            self._w3 = AsyncWeb3(
+                AsyncWeb3.AsyncHTTPProvider(
+                    self.rpc_url,
+                    request_kwargs={"ssl": ssl_context}
+                )
+            )
             
             # Add POA middleware for Polygon
             self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             
-            # Verify connection
-            if not await self._w3.is_connected():
-                self.logger.error("Failed to connect to RPC")
+            # Verify connection by getting block number (is_connected() is unreliable)
+            try:
+                block_num = await self._w3.eth.block_number
+                self.logger.info("RPC connected", block_number=block_num)
+            except Exception as e:
+                self.logger.error("Failed to connect to RPC", error=str(e))
                 return False
             
             # Get contract instance

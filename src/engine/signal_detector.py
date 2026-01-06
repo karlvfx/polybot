@@ -1,8 +1,17 @@
 """
 Signal Detection Engine.
-Identifies potential trading opportunities based on oracle lag.
+
+NEW STRATEGY: Divergence-based signal detection.
+The edge is NOT oracle lag, but market maker lag:
+- Spot price moves significantly
+- PM odds haven't adjusted yet (orderbook stale for 8-12s)
+- We bet before market makers reprice
+
+Key insight: Polymarket uses Chainlink Data Streams (~100ms latency),
+but there's still 8-12 seconds before odds adjust due to market maker delay.
 """
 
+import math
 import time
 from typing import Optional
 from uuid import uuid4
@@ -16,7 +25,7 @@ from src.models.schemas import (
     SignalCandidate,
     SignalDirection,
     SignalType,
-    VolatilityRegime,
+    DivergenceData,
     RejectionReason,
 )
 from config.settings import settings
@@ -24,17 +33,43 @@ from config.settings import settings
 logger = structlog.get_logger()
 
 
+def calculate_spot_implied_prob(momentum_velocity: float, scale: float = 100.0) -> float:
+    """
+    Convert spot price momentum to implied UP probability using logistic function.
+    
+    Args:
+        momentum_velocity: 30s price change as decimal (e.g., 0.01 = 1% up)
+        scale: Sensitivity factor (higher = sharper probability curve)
+    
+    Returns:
+        Implied probability of UP (0.0 to 1.0)
+        
+    Examples (with default scale=100):
+        - 0% move → 50% probability
+        - +0.7% move → ~67% probability
+        - +1% move → ~73% probability  
+        - +2% move → ~88% probability
+        - -1% move → ~27% probability
+    """
+    # Logistic function: 1 / (1 + e^(-x))
+    # momentum_velocity is in decimal form (0.01 = 1%)
+    return 1 / (1 + math.exp(-momentum_velocity * scale))
+
+
 class SignalDetector:
     """
-    Detects trading signals based on oracle-spot price divergence.
+    Detects trading signals based on spot-PM divergence.
     
-    Primary conditions:
-    1. Spot price moved significantly (regime-adaptive threshold)
-    2. Volume confirms authenticity
-    3. Move is spike-like, not smooth drift
-    4. Oracle is in optimal age window
-    5. Polymarket odds are mispriced
-    6. Liquidity is sufficient and stable
+    NEW STRATEGY (Divergence-based):
+    1. Calculate what probability spot price movement implies
+    2. Compare to current PM odds (YES price = UP probability)
+    3. Signal when divergence > 8% AND PM orderbook stale > 8 seconds
+    
+    Supporting filters:
+    - Volume surge confirms move authenticity
+    - Spike concentration rejects smooth drift
+    - Exchange agreement validates price
+    - Liquidity ensures we can fill
     """
     
     def __init__(self):
@@ -44,42 +79,70 @@ class SignalDetector:
         self._recent_signals: list[tuple[int, str]] = []  # (timestamp_ms, direction)
         self._signal_cooldown_ms = 10_000  # 10 second cooldown between signals
     
-    def _calculate_move_threshold(self, consensus: ConsensusData) -> float:
-        """Calculate dynamic move threshold based on ATR."""
-        base_threshold = settings.signals.min_spot_move_pct
-        atr_based = settings.signals.atr_multiplier * consensus.atr_5m
-        return max(base_threshold, atr_based)
+    # ==========================================================================
+    # CORE: Divergence Calculation
+    # ==========================================================================
     
-    def _get_oracle_age_window(self, regime: VolatilityRegime) -> tuple[int, int]:
-        """Get oracle age window based on volatility regime."""
-        if regime == VolatilityRegime.LOW:
-            min_age = settings.chainlink.oracle_min_age_low_vol
-        else:
-            min_age = settings.chainlink.oracle_min_age_normal_vol
-        
-        max_age = settings.chainlink.oracle_max_age
-        return min_age, max_age
-    
-    def _calculate_implied_probability(
+    def calculate_divergence(
         self,
-        spot_price: float,
-        oracle_price: float,
-        move_pct: float,
-    ) -> float:
+        consensus: ConsensusData,
+        pm_data: PolymarketData,
+    ) -> DivergenceData:
         """
-        Estimate implied probability that price will be up/down at settlement.
-        Simplified model based on spot-oracle divergence.
+        Calculate spot-PM divergence - the core signal.
+        
+        Args:
+            consensus: Spot price data from exchanges
+            pm_data: Polymarket orderbook data
+            
+        Returns:
+            DivergenceData with all divergence metrics
         """
-        # If spot moved up significantly vs oracle, probability of UP increases
-        divergence = (spot_price - oracle_price) / oracle_price
+        # Get spot price momentum (30s move)
+        spot_move = consensus.move_30s_pct
         
-        # Base probability + adjustment for divergence
-        # This is simplified - real model would be more sophisticated
-        base_prob = 0.5
-        adjustment = divergence * 5  # Scale factor
+        # Calculate what spot move implies for UP probability
+        spot_implied = calculate_spot_implied_prob(
+            spot_move,
+            scale=settings.signals.spot_implied_scale,
+        )
         
-        implied = base_prob + adjustment
-        return max(0.0, min(1.0, implied))
+        # PM implied probability (YES price = UP probability)
+        pm_implied = pm_data.yes_bid  # Use bid price (what we'd pay to buy YES)
+        
+        # Calculate divergence (absolute difference)
+        divergence = abs(spot_implied - pm_implied)
+        
+        # Determine signal direction
+        if spot_implied > pm_implied:
+            direction = "UP"  # Spot implies higher UP prob than PM shows
+        else:
+            direction = "DOWN"  # Spot implies lower UP prob (so DOWN is mispriced)
+        
+        # Get PM orderbook staleness
+        pm_age = pm_data.orderbook_age_seconds
+        
+        # Check if actionable
+        is_actionable = (
+            divergence >= settings.signals.min_divergence_pct and
+            pm_age >= settings.signals.min_pm_staleness_seconds and
+            pm_age <= settings.signals.max_pm_staleness_seconds
+        )
+        
+        return DivergenceData(
+            spot_implied_prob=spot_implied,
+            pm_implied_prob=pm_implied,
+            divergence=divergence,
+            pm_orderbook_age_seconds=pm_age,
+            signal_direction=direction,
+            is_actionable=is_actionable,
+            min_divergence=settings.signals.min_divergence_pct,
+            min_pm_age=settings.signals.min_pm_staleness_seconds,
+        )
+    
+    # ==========================================================================
+    # Supporting Filters
+    # ==========================================================================
     
     def _is_duplicate_signal(self, direction: SignalDirection) -> bool:
         """Check if we recently generated a similar signal."""
@@ -98,166 +161,142 @@ class SignalDetector:
         
         return False
     
-    def _check_primary_conditions(
+    def _check_supporting_conditions(
         self,
         consensus: ConsensusData,
-        oracle: OracleData,
         pm_data: PolymarketData,
-    ) -> tuple[bool, Optional[RejectionReason], bool]:
+        divergence_data: DivergenceData,
+    ) -> tuple[bool, Optional[RejectionReason]]:
         """
-        Check primary trigger conditions.
-        Returns: (passed, rejection_reason, escape_clause_used)
+        Check supporting conditions (volume, spike, liquidity).
+        
+        These are softer filters that help avoid bad trades.
+        Returns: (passed, rejection_reason)
         """
-        move_threshold = self._calculate_move_threshold(consensus)
-        move_pct = abs(consensus.move_30s_pct)
-        
-        # Check spot movement (with escape clause)
-        escape_clause_used = False
-        if move_pct < settings.signals.escape_clause_min_move:
-            return False, RejectionReason.INSUFFICIENT_MOVE, False
-        
-        if move_pct < move_threshold:
-            # Check escape clause conditions
-            escape_conditions = [
-                oracle.oracle_age_seconds >= settings.signals.escape_clause_min_oracle_age,
-                pm_data.orderbook_imbalance_ratio > (1 + settings.signals.escape_clause_min_imbalance)
-                or pm_data.orderbook_imbalance_ratio < (1 - settings.signals.escape_clause_min_imbalance),
-                pm_data.yes_liquidity_best >= settings.signals.escape_clause_min_liquidity,
-                consensus.volume_surge_ratio >= settings.signals.escape_clause_min_volume_surge,
-            ]
-            
-            if not all(escape_conditions):
-                return False, RejectionReason.INSUFFICIENT_MOVE, False
-            
-            escape_clause_used = True
-            self.logger.info(
-                "Escape clause triggered",
-                move_pct=move_pct,
-                threshold=move_threshold,
-            )
-        
-        # Check volume surge
+        # Volume surge - confirms move is real
         if consensus.volume_surge_ratio < settings.signals.volume_surge_threshold:
-            return False, RejectionReason.VOLUME_LOW, escape_clause_used
+            self.logger.debug(
+                "Volume surge insufficient",
+                volume_surge=consensus.volume_surge_ratio,
+                required=settings.signals.volume_surge_threshold,
+            )
+            return False, RejectionReason.VOLUME_LOW
         
-        # Check spike concentration (avoid smooth drift)
+        # Spike concentration - rejects smooth drift
         if consensus.spike_concentration < settings.signals.spike_concentration_threshold:
-            return False, RejectionReason.SMOOTH_DRIFT, escape_clause_used
+            self.logger.debug(
+                "Smooth drift detected",
+                spike_concentration=consensus.spike_concentration,
+                required=settings.signals.spike_concentration_threshold,
+            )
+            return False, RejectionReason.SMOOTH_DRIFT
         
-        # Check exchange agreement
+        # Exchange agreement
         if not consensus.agreement:
-            return False, RejectionReason.CONSENSUS_FAILURE, escape_clause_used
+            return False, RejectionReason.CONSENSUS_FAILURE
         
-        # Check oracle age window
-        min_age, max_age = self._get_oracle_age_window(consensus.volatility_regime)
+        if consensus.agreement_score < settings.signals.min_agreement_score:
+            self.logger.debug(
+                "Poor exchange agreement",
+                agreement_score=consensus.agreement_score,
+                required=settings.signals.min_agreement_score,
+            )
+            return False, RejectionReason.CONSENSUS_FAILURE
         
-        if oracle.oracle_age_seconds < min_age:
-            return False, RejectionReason.ORACLE_TOO_FRESH, escape_clause_used
-        
-        if oracle.oracle_age_seconds > max_age:
-            return False, RejectionReason.ORACLE_TOO_STALE, escape_clause_used
-        
-        # Check for fast heartbeat mode
-        if oracle.is_fast_heartbeat_mode:
-            return False, RejectionReason.FAST_HEARTBEAT_MODE, escape_clause_used
-        
-        # Check volatility filter
+        # Volatility check
         if consensus.volatility_30s > settings.signals.max_volatility_30s:
-            return False, RejectionReason.VOLATILITY_TOO_HIGH, escape_clause_used
+            return False, RejectionReason.VOLATILITY_TOO_HIGH
         
-        # Check liquidity
+        # Liquidity check
         if pm_data.yes_liquidity_best < settings.signals.min_liquidity_eur:
-            return False, RejectionReason.LIQUIDITY_LOW, escape_clause_used
+            return False, RejectionReason.LIQUIDITY_LOW
         
-        # Check liquidity collapse
         if pm_data.liquidity_collapsing:
-            return False, RejectionReason.LIQUIDITY_COLLAPSING, escape_clause_used
+            return False, RejectionReason.LIQUIDITY_COLLAPSING
         
-        return True, None, escape_clause_used
+        # Minimum spot move (prevents noise signals)
+        if abs(consensus.move_30s_pct) < settings.signals.min_spot_move_pct:
+            return False, RejectionReason.INSUFFICIENT_MOVE
+        
+        return True, None
     
-    def _check_mispricing(
-        self,
-        consensus: ConsensusData,
-        oracle: OracleData,
-        pm_data: PolymarketData,
-        direction: SignalDirection,
-    ) -> tuple[bool, float]:
-        """
-        Check if Polymarket odds are sufficiently mispriced.
-        Returns: (is_mispriced, mispricing_magnitude)
-        """
-        # Calculate what probability "should" be based on spot movement
-        spot_implied = self._calculate_implied_probability(
-            consensus.consensus_price,
-            oracle.current_value,
-            consensus.move_30s_pct,
-        )
-        
-        # Get current PM implied probability
-        pm_implied = pm_data.implied_probability
-        
-        # Calculate mispricing
-        if direction == SignalDirection.UP:
-            # For UP signal, we want PM probability to be lower than it should be
-            mispricing = spot_implied - pm_implied
-        else:
-            # For DOWN signal, we want PM probability to be higher than it should be
-            mispricing = pm_implied - (1 - spot_implied)
-        
-        is_mispriced = mispricing >= settings.signals.min_mispricing_pct
-        
-        return is_mispriced, mispricing
+    # ==========================================================================
+    # Main Detection Methods
+    # ==========================================================================
     
     def detect(
         self,
         consensus: ConsensusData,
-        oracle: OracleData,
+        oracle: Optional[OracleData],
         pm_data: PolymarketData,
     ) -> Optional[SignalCandidate]:
         """
         Detect if current market state presents a trading opportunity.
         
+        NEW: Uses divergence-based detection as primary signal.
+        
         Args:
             consensus: Aggregated spot price data
-            oracle: Chainlink oracle data
+            oracle: Chainlink oracle data (optional, not primary signal anymore)
             pm_data: Polymarket orderbook data
             
         Returns:
             SignalCandidate if opportunity detected, None otherwise
         """
+        # Calculate divergence (core signal)
+        divergence_data = self.calculate_divergence(consensus, pm_data)
+        
+        # Log divergence state
+        self.logger.debug(
+            "Divergence check",
+            spot_implied=f"{divergence_data.spot_implied_prob:.2%}",
+            pm_implied=f"{divergence_data.pm_implied_prob:.2%}",
+            divergence=f"{divergence_data.divergence:.2%}",
+            pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
+            is_actionable=divergence_data.is_actionable,
+            direction=divergence_data.signal_direction,
+        )
+        
+        # Primary check: Is divergence actionable?
+        if not divergence_data.is_actionable:
+            # Log why not actionable
+            if divergence_data.divergence < settings.signals.min_divergence_pct:
+                self.logger.debug(
+                    "Divergence too low",
+                    divergence=f"{divergence_data.divergence:.2%}",
+                    required=f"{settings.signals.min_divergence_pct:.2%}",
+                )
+            elif divergence_data.pm_orderbook_age_seconds < settings.signals.min_pm_staleness_seconds:
+                self.logger.debug(
+                    "PM orderbook too fresh",
+                    pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
+                    required=f"{settings.signals.min_pm_staleness_seconds:.1f}s",
+                )
+            elif divergence_data.pm_orderbook_age_seconds > settings.signals.max_pm_staleness_seconds:
+                self.logger.debug(
+                    "PM orderbook too stale (opportunity passed)",
+                    pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
+                    max_allowed=f"{settings.signals.max_pm_staleness_seconds:.1f}s",
+                )
+            return None
+        
         # Determine direction
-        if consensus.move_30s_pct > 0:
-            direction = SignalDirection.UP
-        else:
-            direction = SignalDirection.DOWN
+        direction = SignalDirection.UP if divergence_data.signal_direction == "UP" else SignalDirection.DOWN
         
         # Check for duplicate signal
         if self._is_duplicate_signal(direction):
             self.logger.debug("Duplicate signal suppressed", direction=direction.value)
             return None
         
-        # Check primary conditions
-        passed, rejection, escape_used = self._check_primary_conditions(
-            consensus, oracle, pm_data
+        # Check supporting conditions
+        passed, rejection = self._check_supporting_conditions(
+            consensus, pm_data, divergence_data
         )
         
         if not passed:
             self.logger.debug(
-                "Primary conditions failed",
+                "Supporting conditions failed",
                 rejection=rejection.value if rejection else None,
-            )
-            return None
-        
-        # Check mispricing
-        is_mispriced, mispricing = self._check_mispricing(
-            consensus, oracle, pm_data, direction
-        )
-        
-        if not is_mispriced:
-            self.logger.debug(
-                "Insufficient mispricing",
-                mispricing=mispricing,
-                threshold=settings.signals.min_mispricing_pct,
             )
             return None
         
@@ -269,7 +308,7 @@ class SignalDetector:
             timestamp_ms=now_ms,
             market_id=pm_data.market_id,
             direction=direction,
-            signal_type=SignalType.ESCAPE_CLAUSE if escape_used else SignalType.STANDARD,
+            signal_type=SignalType.STANDARD,
             consensus=consensus,
             oracle=oracle,
             polymarket=pm_data,
@@ -279,21 +318,46 @@ class SignalDetector:
         self._recent_signals.append((now_ms, direction.value))
         
         self.logger.info(
-            "Signal candidate detected",
-            signal_id=signal.signal_id,
+            "🎯 SIGNAL DETECTED (Divergence Strategy)",
+            signal_id=signal.signal_id[:8],
             direction=direction.value,
-            signal_type=signal.signal_type.value,
-            move_pct=consensus.move_30s_pct,
-            oracle_age=oracle.oracle_age_seconds,
-            mispricing=mispricing,
+            divergence=f"{divergence_data.divergence:.2%}",
+            spot_implied=f"{divergence_data.spot_implied_prob:.2%}",
+            pm_implied=f"{divergence_data.pm_implied_prob:.2%}",
+            pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
+            spot_move=f"{consensus.move_30s_pct:.2%}",
+            volume_surge=f"{consensus.volume_surge_ratio:.1f}x",
         )
         
         return signal
+    
+    # ==========================================================================
+    # Legacy method (kept for backward compatibility)
+    # ==========================================================================
+    
+    def detect_legacy(
+        self,
+        consensus: ConsensusData,
+        oracle: OracleData,
+        pm_data: PolymarketData,
+    ) -> Optional[SignalCandidate]:
+        """
+        LEGACY: Oracle age-based detection.
+        
+        Kept for backward compatibility and A/B testing.
+        Use detect() for the new divergence-based strategy.
+        """
+        # This is the old oracle-age based logic
+        # Keeping it available for comparison but not using by default
+        self.logger.warning("Using legacy oracle-based detection (deprecated)")
+        return self.detect(consensus, oracle, pm_data)
     
     def get_metrics(self) -> dict:
         """Get detector metrics."""
         return {
             "recent_signals_count": len(self._recent_signals),
             "signal_cooldown_ms": self._signal_cooldown_ms,
+            "strategy": "divergence",
+            "min_divergence": settings.signals.min_divergence_pct,
+            "min_pm_staleness": settings.signals.min_pm_staleness_seconds,
         }
-

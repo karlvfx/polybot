@@ -24,11 +24,13 @@ from src.engine.signal_detector import SignalDetector
 from src.engine.validator import Validator
 from src.engine.confidence import ConfidenceScorer
 from src.engine.execution import ExecutionEngine
+from src.engine.multi_asset import MultiAssetManager
 from src.modes.shadow import ShadowMode
 from src.modes.alert import AlertMode
 from src.modes.night_auto import NightAutoMode
 from src.utils.logging import setup_logging, SignalLogger, MetricsLogger, PerformanceTracker
 from src.utils.alerts import DiscordAlerter
+from src.utils.time_filter import TimeOfDayAnalyzer
 from src.models.schemas import ExchangeTick, SignalCandidate
 
 logger = structlog.get_logger()
@@ -56,7 +58,14 @@ class TradingBot:
         self.metrics_logger = MetricsLogger()
         self.performance = PerformanceTracker()
         
-        # Initialize feeds
+        # Parse configured assets
+        self.assets = [a.strip().upper() for a in settings.assets.split(",") if a.strip()]
+        self.logger.info("Configured assets", assets=self.assets)
+        
+        # Multi-asset manager (handles feeds for all assets)
+        self.multi_asset: Optional[MultiAssetManager] = None
+        
+        # Legacy single-asset feeds (for backwards compatibility)
         self.binance_feed = BinanceFeed(
             symbol=settings.exchanges.binance_symbol,
             ws_url=settings.exchanges.binance_ws_url,
@@ -73,11 +82,17 @@ class TradingBot:
         self.chainlink_feed: Optional[ChainlinkFeed] = None
         self.polymarket_feed: Optional[PolymarketFeed] = None
         
+        # Initialize time-of-day analyzer (loads historical win rates)
+        self.time_analyzer = TimeOfDayAnalyzer(log_dir="logs")
+        self.time_analyzer.load_from_logs()
+        
         # Initialize engine components
         self.consensus_engine = ConsensusEngine()
         self.signal_detector = SignalDetector()
         self.validator = Validator()
-        self.confidence_scorer = ConfidenceScorer()
+        
+        # Confidence scorer with time-of-day integration
+        self.confidence_scorer = ConfidenceScorer(time_analyzer=self.time_analyzer)
         
         # Execution engine (initialized later with credentials)
         self.execution_engine: Optional[ExecutionEngine] = None
@@ -130,19 +145,42 @@ class TradingBot:
         return True
     
     async def _initialize_polymarket(self) -> bool:
-        """Initialize Polymarket feed."""
-        if not settings.polymarket.btc_up_market_id:
-            self.logger.warning("No Polymarket market ID configured - feed disabled")
-            return False
-        
+        """Initialize Polymarket feed with auto-discovery."""
+        # Create feed with auto-discovery enabled
         self.polymarket_feed = PolymarketFeed(
-            market_id=settings.polymarket.btc_up_market_id,
+            market_id=None,  # Always auto-discover
             ws_url=settings.polymarket.ws_url,
+            auto_discover=True,
         )
-        return True
+        
+        self.logger.info("Discovering BTC 15-minute market...")
+        discovered = await self.polymarket_feed._discover_market()
+        
+        if discovered and self.polymarket_feed._discovered_market:
+            market_info = self.polymarket_feed._discovered_market
+            
+            # Notify Discord about discovered market
+            if self.alerter:
+                await self.alerter.send_message(
+                    f"🔍 **Market Discovered**\n"
+                    f"**Question:** {market_info.question[:100]}\n"
+                    f"**Type:** {market_info.outcome.upper()}\n"
+                    f"**ID:** `{market_info.condition_id[:40]}...`\n"
+                    f"_Market will auto-refresh every 15 minutes_"
+                )
+            return True
+        else:
+            self.logger.error("Could not discover BTC 15-minute market")
+            if self.alerter:
+                await self.alerter.send_message(
+                    "❌ **Market Discovery Failed**\n"
+                    "Could not find BTC 15-minute market.\n"
+                    "Will retry on next startup."
+                )
+            return False
     
     async def _initialize_execution(self) -> bool:
-        """Initialize execution engine."""
+        """Initialize execution engine with feed references for pre-trade checks."""
         if not settings.wallet_address or not settings.private_key:
             self.logger.warning("No wallet configured - execution disabled")
             return False
@@ -155,6 +193,8 @@ class TradingBot:
             rpc_url=settings.chainlink.polygon_rpc_url,
             wallet_address=settings.wallet_address,
             private_key=settings.private_key,
+            polymarket_feed=self.polymarket_feed,  # For pre-trade slippage simulation
+            chainlink_feed=self.chainlink_feed,    # For adaptive exit oracle tracking
         )
         
         return await self.execution_engine.initialize()
@@ -166,8 +206,21 @@ class TradingBot:
             self.logger.info("Initialized SHADOW mode")
         
         elif settings.mode == OperatingMode.ALERT:
-            self.mode = AlertMode(settings.alerts.discord_webhook_url)
-            self.logger.info("Initialized ALERT mode")
+            # Initialize AlertMode with feed references for virtual trading
+            self.logger.info(
+                "Initializing ALERT mode",
+                has_polymarket_feed=self.polymarket_feed is not None,
+                has_chainlink_feed=self.chainlink_feed is not None,
+            )
+            self.mode = AlertMode(
+                discord_webhook_url=settings.alerts.discord_webhook_url,
+                polymarket_feed=self.polymarket_feed,
+                chainlink_feed=self.chainlink_feed,
+            )
+            self.logger.info(
+                "ALERT mode initialized",
+                virtual_trader_active=self.mode._virtual_trader is not None,
+            )
         
         elif settings.mode == OperatingMode.NIGHT_AUTO:
             if not self.execution_engine:
@@ -183,38 +236,73 @@ class TradingBot:
         self.mode.activate()
     
     async def _check_signals(self) -> None:
-        """Check for trading signals."""
+        """Check for trading signals across all assets."""
         # Rate limit signal checking
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_signal_check_ms < self._signal_check_interval_ms:
             return
         self._last_signal_check_ms = now_ms
         
-        # Get consensus data
-        consensus = self.consensus_engine.compute_consensus()
+        # Check signals for each asset
+        if self.multi_asset:
+            for asset in self.assets:
+                await self._check_signals_for_asset(asset)
+        else:
+            # Legacy single-asset mode
+            await self._check_signals_for_asset("BTC")
+    
+    async def _check_signals_for_asset(self, asset: str) -> None:
+        """Check for trading signals for a specific asset."""
+        now_ms = int(time.time() * 1000)
+        
+        # Get data for this asset
+        if self.multi_asset and asset in self.multi_asset.asset_feeds:
+            feeds = self.multi_asset.asset_feeds[asset]
+            consensus = feeds.consensus_engine.compute_consensus() if feeds.consensus_engine else None
+            oracle = feeds.chainlink.get_data() if feeds.chainlink else None
+            pm_data = feeds.polymarket.get_data() if feeds.polymarket else None
+        else:
+            # Legacy single-asset mode
+            consensus = self.consensus_engine.compute_consensus()
+            oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
+            pm_data = self.polymarket_feed.get_data() if self.polymarket_feed else None
+        
         if not consensus:
             return
         
-        # Get oracle data
-        oracle = None
-        if self.chainlink_feed:
-            oracle = self.chainlink_feed.get_data()
-        
-        if not oracle:
+        # Oracle is optional for some assets (like XRP)
+        # But we still need Polymarket data
+        if not pm_data:
             return
         
-        # Get Polymarket data
-        pm_data = None
-        if self.polymarket_feed:
-            pm_data = self.polymarket_feed.get_data()
+        # Periodic status log (every 30 seconds per asset)
+        if not hasattr(self, '_last_status_log_ms_by_asset'):
+            self._last_status_log_ms_by_asset = {}
+        last_log = self._last_status_log_ms_by_asset.get(asset, 0)
+        if now_ms - last_log > 30000:
+            self._last_status_log_ms_by_asset[asset] = now_ms
+            oracle_info = f"${oracle.current_value:.2f} (age: {oracle.oracle_age_seconds:.1f}s)" if oracle else "N/A"
+            self.logger.info(
+                "Signal check status",
+                asset=asset,
+                consensus_price=f"${consensus.consensus_price:.2f}",
+                move_30s=f"{consensus.move_30s_pct:.3f}%",
+                oracle=oracle_info,
+                pm_yes_bid=f"{pm_data.yes_bid:.3f}",
+                pm_spread=f"{pm_data.spread:.3f}",
+            )
         
-        if not pm_data:
+        # For assets without oracle, skip signal detection (oracle-lag strategy requires oracle)
+        if not oracle:
             return
         
         # Detect signal
         signal = self.signal_detector.detect(consensus, oracle, pm_data)
         if not signal:
             return
+        
+        # Tag signal with asset
+        signal.market_id = f"{asset}_{signal.market_id}"
         
         # Validate signal
         validation = self.validator.validate(signal)
@@ -261,6 +349,13 @@ class TradingBot:
                 log_entry.outcome.filled = outcome.filled
                 log_entry.outcome.exit_price = outcome.exit_price
                 log_entry.outcome.net_profit_eur = outcome.net_profit_eur
+                
+                # Update time-of-day analyzer with outcome for continuous learning
+                self.time_analyzer.add_signal_result(
+                    timestamp_ms=signal.timestamp_ms,
+                    won=outcome.net_profit_eur > 0,
+                    profit_eur=outcome.net_profit_eur,
+                )
             
             self.signal_logger.log_signal(log_entry)
             
@@ -273,41 +368,225 @@ class TradingBot:
     
     async def _feed_health_monitor(self) -> None:
         """Monitor feed health and log metrics."""
+        # Wait for feeds to connect before first status report
+        self.logger.info("Health monitor waiting for feeds to connect...")
+        try:
+            await asyncio.sleep(10)  # Give feeds 10 seconds to connect
+        except asyncio.CancelledError:
+            self.logger.info("Health monitor cancelled during startup wait")
+            return
+        
+        # Send first status immediately after wait
+        last_market_status_time = 0  # Force immediate first report
+        market_status_interval = 60  # Then report every 60 seconds
+        
         while self._running:
             try:
-                feeds = {
-                    "binance": self.binance_feed.get_metrics(),
-                    "coinbase": self.coinbase_feed.get_metrics(),
-                    "kraken": self.kraken_feed.get_metrics(),
-                }
+                # Get feed health status - use multi-asset feeds if available
+                if self.multi_asset and self.assets:
+                    # Use first asset's exchange feeds for status
+                    primary_asset = self.assets[0]
+                    asset_feeds = self.multi_asset.asset_feeds.get(primary_asset)
+                    if asset_feeds:
+                        exchange_feeds = {
+                            "binance": asset_feeds.binance,
+                            "coinbase": asset_feeds.coinbase,
+                            "kraken": asset_feeds.kraken,
+                        }
+                    else:
+                        exchange_feeds = {}
+                else:
+                    # Legacy single-asset mode
+                    exchange_feeds = {
+                        "binance": self.binance_feed,
+                        "coinbase": self.coinbase_feed,
+                        "kraken": self.kraken_feed,
+                    }
+                
+                # Build metrics dict for logging
+                feeds_serializable = {}
+                for name, feed in exchange_feeds.items():
+                    if feed:
+                        metrics = feed.get_metrics()
+                        feeds_serializable[name] = {
+                            "connected": feed.health.connected,
+                            "price": metrics.current_price if hasattr(metrics, 'current_price') else 0,
+                            "is_stale": feed.health.is_stale,
+                            "error_count": feed.health.error_count,
+                        }
+                    else:
+                        feeds_serializable[name] = {"connected": False, "price": 0, "is_stale": True}
                 
                 if self.chainlink_feed:
-                    feeds["chainlink"] = self.chainlink_feed.get_metrics()
+                    cl_metrics = self.chainlink_feed.get_metrics()
+                    feeds_serializable["chainlink"] = cl_metrics if isinstance(cl_metrics, dict) else {
+                        "connected": self.chainlink_feed.connected,
+                        "price": cl_metrics.get("price", 0) if isinstance(cl_metrics, dict) else 0,
+                        "oracle_age_seconds": cl_metrics.get("oracle_age_seconds", 0) if isinstance(cl_metrics, dict) else 0,
+                    }
                 
                 if self.polymarket_feed:
-                    feeds["polymarket"] = self.polymarket_feed.get_metrics()
+                    pm_metrics = self.polymarket_feed.get_metrics()
+                    feeds_serializable["polymarket"] = pm_metrics if isinstance(pm_metrics, dict) else {}
                 
-                self.metrics_logger.log_feed_health(feeds)
+                self.metrics_logger.log_feed_health(feeds_serializable)
                 
                 # Check for stale feeds
-                stale_feeds = [name for name, metrics in feeds.items() 
-                              if metrics.get("is_stale", True)]
+                stale_feeds = [name for name, m in feeds_serializable.items() 
+                              if m.get("is_stale", False)]
                 
                 if stale_feeds:
                     self.logger.warning("Stale feeds detected", feeds=stale_feeds)
                 
-                await asyncio.sleep(5)
+                # Periodic market status update to Discord
+                now = int(time.time())
+                if self.alerter and now - last_market_status_time >= market_status_interval:
+                    last_market_status_time = now
+                    
+                    # Build status message from feed health
+                    exchange_status = []
+                    for name, feed in exchange_feeds.items():
+                        if feed:
+                            metrics = feed.get_metrics()
+                            connected = "✅" if feed.health.connected else "❌"
+                            price = metrics.current_price if hasattr(metrics, 'current_price') else 0
+                            exchange_status.append(f"{name.capitalize()}: {connected} ${price:,.2f}")
+                        else:
+                            exchange_status.append(f"{name.capitalize()}: ❌ Not initialized")
+                    
+                    # Build multi-asset status
+                    asset_status_lines = []
+                    if self.multi_asset:
+                        for asset in self.assets:
+                            asset_feeds = self.multi_asset.asset_feeds.get(asset)
+                            if asset_feeds:
+                                # Get consensus price from exchanges
+                                consensus = asset_feeds.consensus_engine.compute_consensus() if asset_feeds.consensus_engine else None
+                                if consensus and consensus.consensus_price > 0:
+                                    price = f"${consensus.consensus_price:,.2f}"
+                                    price_emoji = "✅"
+                                else:
+                                    price = "connecting..."
+                                    price_emoji = "⏳"
+                                
+                                # Get PM status - check both data and discovered market
+                                pm_info = "N/A"
+                                if asset_feeds.polymarket:
+                                    pm_data = asset_feeds.polymarket.get_data()
+                                    discovered = asset_feeds.polymarket._discovered_market
+                                    if pm_data and pm_data.yes_bid > 0:
+                                        pm_info = f"YES:{pm_data.yes_bid:.2f} NO:{pm_data.no_bid:.2f}"
+                                    elif discovered:
+                                        pm_info = f"Market found (loading...)"
+                                    else:
+                                        pm_info = "No market"
+                                
+                                # Get oracle status
+                                oracle_info = "N/A"
+                                if asset_feeds.chainlink:
+                                    oracle_data = asset_feeds.chainlink.get_data()
+                                    if oracle_data:
+                                        oracle_info = f"${oracle_data.current_value:,.0f} ({oracle_data.oracle_age_seconds:.0f}s)"
+                                    else:
+                                        oracle_info = "connecting..."
+                                
+                                asset_status_lines.append(f"  {asset}: {price_emoji} {price}")
+                                asset_status_lines.append(f"      PM: {pm_info}")
+                                asset_status_lines.append(f"      Oracle: {oracle_info}")
+                            else:
+                                asset_status_lines.append(f"  {asset}: ❌ Not initialized")
+                    
+                    # Fallback to single-asset status
+                    pm_status = "Not initialized"
+                    if self.polymarket_feed:
+                        pm_metrics = self.polymarket_feed.get_metrics()
+                        if self.polymarket_feed.health.connected:
+                            has_data = pm_metrics.get("has_orderbook_data", False) if isinstance(pm_metrics, dict) else False
+                            yes_bid = pm_metrics.get("yes_bid", 0) if isinstance(pm_metrics, dict) else 0
+                            pm_status = f"✅ Yes bid: {yes_bid:.2f}" if has_data else "⚠️ Connected, no data"
+                        else:
+                            pm_status = "❌ Disconnected"
+                    
+                    oracle_status = "Not initialized"
+                    if self.chainlink_feed:
+                        cl_metrics = self.chainlink_feed.get_metrics()
+                        if self.chainlink_feed.connected:
+                            oracle_price = cl_metrics.get("current_price", 0) if isinstance(cl_metrics, dict) else 0
+                            oracle_age = cl_metrics.get("oracle_age_seconds", 0) if isinstance(cl_metrics, dict) else 0
+                            oracle_status = f"✅ ${oracle_price:,.2f} (age: {oracle_age:.0f}s)"
+                        else:
+                            oracle_status = "❌ Disconnected"
+                    
+                    # Get mode stats including virtual trading
+                    mode_status = ""
+                    if self.mode:
+                        mode_metrics = self.mode.get_metrics()
+                        if isinstance(self.mode, AlertMode):
+                            alerts_sent = mode_metrics.get("alerts_sent", 0)
+                            virtual_stats = mode_metrics.get("virtual_trading", {})
+                            if virtual_stats:
+                                vt_trades = virtual_stats.get("total_trades", 0)
+                                vt_wr = virtual_stats.get("win_rate", 0)
+                                vt_pnl = virtual_stats.get("total_pnl", 0)
+                                vt_open = virtual_stats.get("open_positions", 0)
+                                mode_status = (
+                                    f"\n**Alert Mode:**\n"
+                                    f"  Alerts: {alerts_sent} | Virtual: {vt_trades} trades\n"
+                                    f"  WR: {vt_wr:.0%} | P/L: €{vt_pnl:+.2f} | Open: {vt_open}"
+                                )
+                            else:
+                                mode_status = f"\n**Alert Mode:** {alerts_sent} alerts sent"
+                        elif isinstance(self.mode, ShadowMode):
+                            wr = mode_metrics.get("win_rate", 0)
+                            wins = mode_metrics.get("would_be_wins", 0)
+                            losses = mode_metrics.get("would_be_losses", 0)
+                            mode_status = f"\n**Shadow Mode:** {wins}W/{losses}L ({wr:.0%} WR)"
+                    
+                    # Get signal detector stats
+                    signal_stats = ""
+                    if hasattr(self, 'performance'):
+                        summary = self.performance.get_summary()
+                        total_signals = summary.get("signals", {}).get("total", 0)
+                        signal_stats = f"\n**Signals:** {total_signals} detected this session"
+                    
+                    # Build final status message
+                    if asset_status_lines:
+                        # Multi-asset format
+                        await self.alerter.send_message(
+                            f"📊 **Status Update**\n"
+                            f"**Assets:**\n" + "\n".join(asset_status_lines) +
+                            f"{mode_status}"
+                            f"{signal_stats}"
+                        )
+                    else:
+                        # Legacy single-asset format
+                        await self.alerter.send_message(
+                            f"📊 **Status Update**\n"
+                            f"**Exchanges:**\n" + "\n".join(f"  {s}" for s in exchange_status) + "\n"
+                            f"**Polymarket:** {pm_status}\n"
+                            f"**Oracle:** {oracle_status}"
+                            f"{mode_status}"
+                            f"{signal_stats}"
+                        )
                 
+                await asyncio.sleep(10)  # Check health every 10 seconds
+                
+            except asyncio.CancelledError:
+                self.logger.info("Health monitor cancelled")
+                break
             except Exception as e:
                 self.logger.error("Health monitor error", error=str(e))
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
     
     async def _signal_loop(self) -> None:
         """Main signal detection loop."""
         while self._running:
             try:
                 await self._check_signals()
-                await asyncio.sleep(0.1)  # 100ms tick
+                await asyncio.sleep(0.5)  # 500ms tick (matches signal check interval)
+            except asyncio.CancelledError:
+                self.logger.info("Signal loop cancelled")
+                break
             except Exception as e:
                 self.logger.error("Signal loop error", error=str(e))
                 await asyncio.sleep(1)
@@ -317,16 +596,36 @@ class TradingBot:
         self.logger.info(
             "Starting Polymarket Oracle-Lag Trading Bot",
             mode=settings.mode.value,
+            assets=self.assets,
         )
         
         self._running = True
         
-        # Setup exchange callbacks
-        self._setup_exchange_callbacks()
+        # Always use multi-asset manager (even for single BTC)
+        self.logger.info("Initializing multi-asset manager", assets=self.assets)
+        self.multi_asset = MultiAssetManager()
+        await self.multi_asset.initialize()
         
-        # Initialize components
-        await self._initialize_chainlink()
-        await self._initialize_polymarket()
+        # Use first asset's feeds as primary for mode initialization
+        primary_asset = self.assets[0] if self.assets else "BTC"
+        self.logger.info(f"Setting primary asset feeds: {primary_asset}")
+        
+        if primary_asset in self.multi_asset.asset_feeds:
+            feeds = self.multi_asset.asset_feeds[primary_asset]
+            self.polymarket_feed = feeds.polymarket
+            self.chainlink_feed = feeds.chainlink
+            self.consensus_engine = feeds.consensus_engine
+            self.logger.info(
+                "Primary feeds assigned",
+                has_polymarket=self.polymarket_feed is not None,
+                has_chainlink=self.chainlink_feed is not None,
+                has_consensus=self.consensus_engine is not None,
+            )
+        else:
+            self.logger.error(f"Primary asset {primary_asset} not found in multi_asset.asset_feeds")
+            self.logger.info(f"Available assets: {list(self.multi_asset.asset_feeds.keys())}")
+        
+        # Initialize execution engine
         await self._initialize_execution()
         
         # Initialize mode
@@ -334,83 +633,189 @@ class TradingBot:
         
         # Send startup notification
         if self.alerter:
+            assets_str = ", ".join(self.assets)
+            mode_name = settings.mode.value.upper()
+            
+            # Build mode-specific status
+            if isinstance(self.mode, AlertMode):
+                virtual_status = "✅ Enabled" if self.mode._virtual_trader else "❌ Disabled"
+                mode_info = (
+                    f"**Virtual Trading:** {virtual_status}\n"
+                    f"**Alert Threshold:** {settings.alerts.alert_confidence_threshold:.0%} confidence"
+                )
+            elif isinstance(self.mode, ShadowMode):
+                mode_info = "**Virtual Trading:** Simulates ALL trades (no threshold)"
+            else:
+                mode_info = f"**Mode:** {mode_name}"
+            
             await self.alerter.send_message(
                 f"🚀 **Bot Started**\n"
-                f"Mode: {settings.mode.value.upper()}\n"
-                f"Target: BTC 15-min markets"
+                f"**Mode:** {mode_name}\n"
+                f"**Assets:** {assets_str}\n"
+                f"{mode_info}"
             )
         
         # Start all tasks
-        tasks = [
-            asyncio.create_task(self.binance_feed.start()),
-            asyncio.create_task(self.coinbase_feed.start()),
-            asyncio.create_task(self.kraken_feed.start()),
-            asyncio.create_task(self._feed_health_monitor()),
-            asyncio.create_task(self._signal_loop()),
-        ]
+        self._tasks = []
         
-        if self.chainlink_feed:
-            tasks.append(asyncio.create_task(self.chainlink_feed.start()))
+        # Start multi-asset feeds if enabled
+        if self.multi_asset:
+            await self.multi_asset.start()
+            self._tasks.extend(self.multi_asset._tasks)
+        else:
+            # Legacy single-asset mode
+            self._tasks.extend([
+                asyncio.create_task(self.binance_feed.start(), name="binance_feed"),
+                asyncio.create_task(self.coinbase_feed.start(), name="coinbase_feed"),
+                asyncio.create_task(self.kraken_feed.start(), name="kraken_feed"),
+            ])
+            
+            if self.chainlink_feed:
+                self._tasks.append(asyncio.create_task(self.chainlink_feed.start(), name="chainlink_feed"))
+            
+            if self.polymarket_feed:
+                self._tasks.append(asyncio.create_task(self.polymarket_feed.start(), name="polymarket_feed"))
         
-        if self.polymarket_feed:
-            tasks.append(asyncio.create_task(self.polymarket_feed.start()))
+        # Add health monitor and signal loop for all modes
+        self._tasks.append(asyncio.create_task(self._feed_health_monitor(), name="health_monitor"))
+        self._tasks.append(asyncio.create_task(self._signal_loop(), name="signal_loop"))
         
-        self.logger.info("All feeds started")
+        self.logger.info("All feeds started", task_count=len(self._tasks))
         
         # Wait for shutdown signal
-        await self._shutdown_event.wait()
+        try:
+            await self._shutdown_event.wait()
+        except Exception as e:
+            self.logger.error("Error waiting for shutdown", error=str(e))
         
-        # Cancel all tasks
-        for task in tasks:
-            task.cancel()
+        # Cancel all tasks gracefully
+        self.logger.info("Cancelling all tasks...")
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
         
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Wait for tasks to finish cancelling with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._tasks, return_exceptions=True),
+                timeout=5.0  # 5 second timeout for cleanup
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning("Some tasks didn't finish in time, forcing shutdown")
+        except Exception as e:
+            self.logger.error("Error cancelling tasks", error=str(e))
+        
+        # Call stop to generate reports (this is the main shutdown)
+        await self.stop()
     
     async def stop(self) -> None:
         """Stop the trading bot."""
         self.logger.info("Stopping bot...")
         self._running = False
         
-        # Stop feeds
-        await self.binance_feed.stop()
-        await self.coinbase_feed.stop()
-        await self.kraken_feed.stop()
+        # Stop multi-asset manager if enabled
+        if self.multi_asset:
+            try:
+                await self.multi_asset.stop()
+            except Exception as e:
+                self.logger.error("Error stopping multi-asset manager", error=str(e))
+        else:
+            # Stop legacy single-asset feeds
+            try:
+                await self.binance_feed.stop()
+            except Exception as e:
+                self.logger.error("Error stopping binance feed", error=str(e))
+            
+            try:
+                await self.coinbase_feed.stop()
+            except Exception as e:
+                self.logger.error("Error stopping coinbase feed", error=str(e))
+            
+            try:
+                await self.kraken_feed.stop()
+            except Exception as e:
+                self.logger.error("Error stopping kraken feed", error=str(e))
+            
+            if self.chainlink_feed:
+                try:
+                    await self.chainlink_feed.stop()
+                except Exception as e:
+                    self.logger.error("Error stopping chainlink feed", error=str(e))
+            
+            if self.polymarket_feed:
+                try:
+                    await self.polymarket_feed.stop()
+                except Exception as e:
+                    self.logger.error("Error stopping polymarket feed", error=str(e))
         
-        if self.chainlink_feed:
-            await self.chainlink_feed.stop()
-        
-        if self.polymarket_feed:
-            await self.polymarket_feed.stop()
-        
-        # Deactivate mode
+        # Deactivate mode (may be async for AlertMode)
         if self.mode:
-            self.mode.deactivate()
+            try:
+                if hasattr(self.mode, 'deactivate'):
+                    result = self.mode.deactivate()
+                    # If deactivate returns a coroutine, await it
+                    if asyncio.iscoroutine(result):
+                        await result
+            except Exception as e:
+                self.logger.error("Error deactivating mode", error=str(e))
+        
+        # Close Discord alerter
+        if self.alerter:
+            try:
+                await self.alerter.close()
+            except Exception as e:
+                self.logger.error("Error closing alerter", error=str(e))
         
         # Close loggers
-        self.signal_logger.close()
+        try:
+            self.signal_logger.close()
+        except Exception as e:
+            self.logger.error("Error closing signal logger", error=str(e))
         
-        # Print performance report
-        if isinstance(self.mode, ShadowMode):
-            print(self.mode.generate_report())
+        # Print performance report to stdout (ensures it shows in terminal)
+        print("\n" + "="*70)
+        print("SHUTDOWN REPORT")
+        print("="*70)
         
-        self.performance.print_report()
+        try:
+            if isinstance(self.mode, ShadowMode):
+                print(self.mode.generate_report())
+        except Exception as e:
+            print(f"Error generating shadow mode report: {e}")
+        
+        try:
+            self.performance.print_report()
+        except Exception as e:
+            print(f"Error generating performance report: {e}")
+        
+        # Print time-of-day analysis report
+        try:
+            print(self.time_analyzer.generate_report())
+        except Exception as e:
+            print(f"Error generating time analysis report: {e}")
         
         # Send shutdown notification
         if self.alerter:
-            summary = self.performance.get_summary()
-            await self.alerter.send_message(
-                f"🛑 **Bot Stopped**\n"
-                f"Signals: {summary['signals']['total']}\n"
-                f"Trades: {summary['trades']['total']}\n"
-                f"Net Profit: €{summary['profit']['net']:.2f}"
-            )
+            try:
+                summary = self.performance.get_summary()
+                await self.alerter.send_message(
+                    f"🛑 **Bot Stopped**\n"
+                    f"Signals: {summary['signals']['total']}\n"
+                    f"Trades: {summary['trades']['total']}\n"
+                    f"Net Profit: €{summary['profit']['net']:.2f}"
+                )
+            except Exception as e:
+                self.logger.error("Error sending shutdown notification", error=str(e))
         
         self._shutdown_event.set()
+        print("\n✅ Bot stopped successfully\n")
         self.logger.info("Bot stopped")
     
     def shutdown(self) -> None:
         """Trigger graceful shutdown."""
-        self._shutdown_event.set()
+        if not self._shutdown_event.is_set():
+            self._shutdown_event.set()
+            self.logger.info("Shutdown signal set")
 
 
 def main():
@@ -420,7 +825,8 @@ def main():
     
     # Setup signal handlers
     def signal_handler(sig, frame):
-        print("\nShutdown requested...")
+        print("\n\n🛑 Shutdown requested (Ctrl+C)...")
+        print("Stopping bot and generating report...\n")
         bot.shutdown()
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -430,9 +836,17 @@ def main():
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
-        print("\nInterrupted")
-    finally:
-        asyncio.run(bot.stop())
+        print("\n\n⚠️  Interrupted by user")
+        # stop() is already called from bot.start() after shutdown
+    except Exception as e:
+        print(f"\n\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to stop gracefully even on error
+        try:
+            asyncio.run(bot.stop())
+        except:
+            pass
 
 
 if __name__ == "__main__":

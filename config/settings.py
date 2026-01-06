@@ -34,13 +34,26 @@ class ExchangeSettings(BaseSettings):
     
     kraken_ws_url: str = "wss://ws.kraken.com"
     kraken_pair: str = "XBT/USD"
+    
+    # Multi-asset symbols (asset -> exchange symbol mapping)
+    symbols: dict = Field(default_factory=lambda: {
+        "BTC": {"binance": "btcusdt", "coinbase": "BTC-USD", "kraken": "XBT/USD"},
+        "ETH": {"binance": "ethusdt", "coinbase": "ETH-USD", "kraken": "ETH/USD"},
+        "SOL": {"binance": "solusdt", "coinbase": "SOL-USD", "kraken": "SOL/USD"},
+        "XRP": {"binance": "xrpusdt", "coinbase": "XRP-USD", "kraken": "XRP/USD"},
+    })
 
 
 class ChainlinkSettings(BaseSettings):
     """Settings for Chainlink oracle monitoring."""
     
-    # Polygon Mainnet BTC/USD Chainlink Feed
+    # Polygon Mainnet Chainlink Feed Addresses
     btc_usd_feed_address: str = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+    eth_usd_feed_address: str = "0xF9680D99D6C9589e2a93a78A04A279e509205945"
+    sol_usd_feed_address: str = "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC"
+    # XRP doesn't have a reliable Chainlink feed on Polygon - use spot price only
+    xrp_usd_feed_address: str = ""
+    
     polygon_rpc_url: str = Field(default="", description="Polygon RPC URL (Alchemy/Ankr)")
     polygon_ws_url: str = Field(default="", description="Polygon WebSocket URL")
     
@@ -67,48 +80,79 @@ class PolymarketSettings(BaseSettings):
 
 
 class SignalSettings(BaseSettings):
-    """Signal detection thresholds."""
+    """Signal detection thresholds with multi-layered validation."""
     
-    # Spot movement thresholds
-    min_spot_move_pct: float = 0.007  # 0.7% minimum
+    # ==========================================================================
+    # NEW: Divergence-based signal detection (primary strategy)
+    # The edge: spot price moves but PM odds haven't caught up yet
+    # ==========================================================================
+    
+    # Divergence thresholds
+    min_divergence_pct: float = 0.08  # 8% probability divergence required
+    min_pm_staleness_seconds: float = 8.0  # PM orderbook must be stale for 8+ seconds
+    max_pm_staleness_seconds: float = 30.0  # Don't trade if too stale (opportunity passed)
+    
+    # Spot-implied probability scaling
+    # Controls how sensitive the probability is to price moves
+    # scale=100: 1% move → ~73% prob, 2% move → ~88% prob
+    spot_implied_scale: float = 100.0  # Logistic curve scale factor
+    
+    # ==========================================================================
+    # Spot movement thresholds (supporting filter)
+    # ==========================================================================
+    min_spot_move_pct: float = 0.007  # 0.7% absolute minimum
     atr_multiplier: float = 1.5  # move_threshold = max(0.7%, 1.5 * ATR)
     
-    # Escape clause thresholds
-    escape_clause_min_move: float = 0.008  # 0.8%
-    escape_clause_min_oracle_age: int = 15
-    escape_clause_min_imbalance: float = 0.20
-    escape_clause_min_liquidity: float = 75.0
-    escape_clause_min_volume_surge: float = 2.5
-    escape_clause_confidence_penalty: float = 0.10
+    # Escape clause thresholds (allows sub-threshold moves when strongly supported)
+    escape_clause_min_move: float = 0.008  # 0.8% minimum for escape clause
+    escape_clause_min_oracle_age: int = 15  # Seconds - oracle must be older
+    escape_clause_min_imbalance: float = 0.20  # 20% orderbook imbalance required
+    escape_clause_min_liquidity: float = 75.0  # EUR minimum liquidity
+    escape_clause_min_volume_surge: float = 2.5  # 2.5x volume surge required
+    escape_clause_confidence_penalty: float = 0.10  # 10% confidence penalty
     
-    # Volume and momentum
-    volume_surge_threshold: float = 2.0  # 2x average
-    spike_concentration_threshold: float = 0.60  # 60% of move in 10s
+    # Volume authentication (prevents wash trading/fake breakouts)
+    volume_surge_threshold: float = 1.5  # 1.5x average (lowered from 2.0)
+    
+    # Spike concentration (anti-drift filter)
+    spike_concentration_threshold: float = 0.50  # 50% of move in sharpest 10s (lowered)
     
     # Volatility filter
-    max_volatility_30s: float = 0.005  # 0.5%
+    max_volatility_30s: float = 0.008  # 0.8% - slightly higher tolerance
     
-    # Consensus
-    consensus_price_tolerance: float = 0.0015  # 0.15%
+    # Consensus / Exchange Agreement
+    consensus_price_tolerance: float = 0.0015  # 0.15% max deviation
+    min_agreement_score: float = 0.80  # 80% agreement quality required (lowered)
     
-    # Mispricing detection
-    min_mispricing_pct: float = 0.03  # 3%
+    # Mispricing detection (legacy - kept for backward compat)
+    min_mispricing_pct: float = 0.03  # 3% mispricing required
     
     # Liquidity
-    min_liquidity_eur: float = 50.0
-    liquidity_collapse_threshold: float = 0.60  # 60% of 30s ago
+    min_liquidity_eur: float = 50.0  # EUR at best price
+    liquidity_collapse_threshold: float = 0.60  # Alert if <60% of 30s ago
 
 
 class ConfidenceWeights(BaseSettings):
-    """Confidence scoring component weights."""
+    """
+    Confidence scoring component weights.
     
-    oracle_age_weight: float = 0.35
-    consensus_strength_weight: float = 0.25
-    misalignment_weight: float = 0.15
+    NEW: Divergence-based weights (spot-PM divergence is primary signal).
+    """
+    
+    # Primary signals (60% total)
+    divergence_weight: float = 0.40      # Spot-PM divergence magnitude
+    pm_staleness_weight: float = 0.20    # Orderbook age (stale = opportunity)
+    
+    # Supporting factors (40% total)
+    consensus_strength_weight: float = 0.15
     liquidity_weight: float = 0.10
-    spread_anomaly_weight: float = 0.08
-    volume_surge_weight: float = 0.04
-    spike_concentration_weight: float = 0.03
+    volume_surge_weight: float = 0.08
+    spike_concentration_weight: float = 0.07
+    
+    # Legacy weights (kept at 0 for backward compatibility)
+    oracle_age_weight: float = 0.0       # No longer used as primary signal
+    misalignment_weight: float = 0.0     # Replaced by divergence
+    spread_anomaly_weight: float = 0.0   # Less relevant
 
 
 class ExecutionSettings(BaseSettings):
@@ -174,6 +218,9 @@ class Settings(BaseSettings):
     
     # Operating mode
     mode: OperatingMode = OperatingMode.SHADOW
+    
+    # Assets to trade (comma-separated)
+    assets: str = Field(default="BTC", description="Comma-separated list of assets to trade (BTC,ETH,SOL,XRP)")
     
     # Debug settings
     debug: bool = False

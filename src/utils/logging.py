@@ -123,6 +123,105 @@ class SignalLogger:
         
         self.logger.debug("signal_rejected", reason=reason)
     
+    def log_comprehensive_signal(
+        self,
+        signal_id: str,
+        timestamp_ms: int,
+        direction: str,
+        decision: str,
+        consensus_data: dict,
+        oracle_data: dict,
+        market_data: dict,
+        validation_checks: dict,
+        scoring: dict,
+    ) -> None:
+        """
+        Log comprehensive signal data with all validation metrics.
+        
+        This provides the full picture needed for post-hoc analysis:
+        - Why a signal was generated
+        - What validation checks passed/failed
+        - Exact market conditions at signal time
+        """
+        self._get_log_file()
+        
+        comprehensive_log = {
+            "type": "comprehensive_signal",
+            "signal_id": signal_id,
+            "timestamp_ms": timestamp_ms,
+            "direction": direction,
+            "decision": decision,
+            
+            "spot_data": {
+                "consensus_price": consensus_data.get("consensus_price", 0),
+                "move_30s_pct": consensus_data.get("move_30s_pct", 0),
+                "volume_surge_ratio": consensus_data.get("volume_surge_ratio", 0),
+                "spike_concentration": consensus_data.get("spike_concentration", 0),
+                "atr_5m": consensus_data.get("atr_5m", 0),
+                "volatility_regime": consensus_data.get("volatility_regime", "normal"),
+                "agreement_score": consensus_data.get("agreement_score", 0),
+                "exchange_count": consensus_data.get("exchange_count", 0),
+            },
+            
+            "oracle_data": {
+                "price": oracle_data.get("price", 0),
+                "age_seconds": oracle_data.get("age_seconds", 0),
+                "round_id": oracle_data.get("round_id", 0),
+                "is_fast_heartbeat": oracle_data.get("is_fast_heartbeat", False),
+            },
+            
+            "market_data": {
+                "market_id": market_data.get("market_id"),
+                "liquidity_eur": market_data.get("liquidity_eur", 0),
+                "yes_price": market_data.get("yes_price", 0),
+                "no_price": market_data.get("no_price", 0),
+                "spread": market_data.get("spread", 0),
+                "liquidity_collapsing": market_data.get("liquidity_collapsing", False),
+                "orderbook_imbalance": market_data.get("orderbook_imbalance", 1.0),
+            },
+            
+            "validation": validation_checks,
+            "scoring": scoring,
+        }
+        
+        self._file_handle.write(json.dumps(comprehensive_log) + "\n")
+        self._file_handle.flush()
+        
+        self.logger.info(
+            "comprehensive_signal_logged",
+            signal_id=signal_id,
+            direction=direction,
+            decision=decision,
+            volume_surge=consensus_data.get("volume_surge_ratio", 0),
+            spike_concentration=consensus_data.get("spike_concentration", 0),
+            agreement_score=consensus_data.get("agreement_score", 0),
+            oracle_age=oracle_data.get("age_seconds", 0),
+        )
+    
+    def log_filter_stats(
+        self,
+        period_start_ms: int,
+        period_end_ms: int,
+        stats: dict,
+    ) -> None:
+        """
+        Log periodic filter statistics for threshold tuning.
+        
+        Tracks how many signals were rejected by each filter
+        to help tune thresholds during shadow mode.
+        """
+        self._get_log_file()
+        
+        stats_log = {
+            "type": "filter_stats",
+            "period_start_ms": period_start_ms,
+            "period_end_ms": period_end_ms,
+            "stats": stats,
+        }
+        
+        self._file_handle.write(json.dumps(stats_log) + "\n")
+        self._file_handle.flush()
+    
     def close(self) -> None:
         """Close log file handle."""
         if self._file_handle:

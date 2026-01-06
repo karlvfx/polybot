@@ -4,6 +4,7 @@ Binance WebSocket feed for BTC/USDT real-time price data.
 
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,6 +24,13 @@ class BinanceTick:
     quantity: float
     trade_time_ms: int
     is_buyer_maker: bool
+
+
+@dataclass
+class VolumeEntry:
+    """Volume entry for rolling window."""
+    timestamp_ms: int
+    volume: float
 
 
 class BinanceFeed(BaseFeed):
@@ -47,7 +55,12 @@ class BinanceFeed(BaseFeed):
         )
         
         self._last_tick: Optional[BinanceTick] = None
+        
+        # Enhanced volume tracking with rolling 5-minute buffer
+        self._volume_buffer: deque[VolumeEntry] = deque()
+        self._volume_buffer_max_age_ms = 300_000  # 5 minutes
         self._volume_1m: float = 0.0
+        self._volume_5m_avg: float = 0.0
         self._volume_window_start_ms: int = 0
     
     async def _subscribe(self) -> None:
@@ -108,15 +121,37 @@ class BinanceFeed(BaseFeed):
             self.logger.error("Error handling message", error=str(e))
     
     def _update_volume(self, quantity: float, timestamp_ms: int) -> None:
-        """Update 1-minute rolling volume."""
-        current_window_start = timestamp_ms - (timestamp_ms % 60000)
+        """Update rolling volume with 1-minute current and 5-minute average."""
+        # Add to rolling buffer
+        self._volume_buffer.append(VolumeEntry(
+            timestamp_ms=timestamp_ms,
+            volume=quantity,
+        ))
         
-        if current_window_start != self._volume_window_start_ms:
-            # New minute window
-            self._volume_1m = quantity
-            self._volume_window_start_ms = current_window_start
+        # Clean up old entries
+        cutoff_ms = timestamp_ms - self._volume_buffer_max_age_ms
+        while self._volume_buffer and self._volume_buffer[0].timestamp_ms < cutoff_ms:
+            self._volume_buffer.popleft()
+        
+        # Calculate 1-minute volume (last 60 seconds)
+        cutoff_1m = timestamp_ms - 60_000
+        self._volume_1m = sum(
+            e.volume for e in self._volume_buffer 
+            if e.timestamp_ms >= cutoff_1m
+        )
+        
+        # Calculate 5-minute average (volume per minute over 5 minutes)
+        if len(self._volume_buffer) >= 2:
+            total_volume = sum(e.volume for e in self._volume_buffer)
+            time_span_ms = self._volume_buffer[-1].timestamp_ms - self._volume_buffer[0].timestamp_ms
+            if time_span_ms > 0:
+                # Convert to volume per minute
+                minutes = time_span_ms / 60_000
+                self._volume_5m_avg = total_volume / max(minutes, 1.0)
+            else:
+                self._volume_5m_avg = total_volume
         else:
-            self._volume_1m += quantity
+            self._volume_5m_avg = self._volume_1m
     
     def get_metrics(self) -> ExchangeMetrics:
         """Get current exchange metrics."""
@@ -132,6 +167,7 @@ class BinanceFeed(BaseFeed):
             velocity_30s=self.price_buffer.get_velocity(30),
             volatility_30s=self.price_buffer.get_volatility(30),
             volume_1m=self._volume_1m,
+            volume_5m_avg=self._volume_5m_avg,
             atr_5m=self.price_buffer.get_atr(300, 60),
             max_move_10s_pct=self.price_buffer.get_max_move_in_subwindow(30, 10),
         )
@@ -159,12 +195,47 @@ class BinanceAggTradeFeed(BaseFeed):
             ws_url=self.stream_url,
         )
         
+        # Enhanced volume tracking with rolling 5-minute buffer
+        self._volume_buffer: deque[VolumeEntry] = deque()
+        self._volume_buffer_max_age_ms = 300_000  # 5 minutes
         self._volume_1m: float = 0.0
-        self._volume_window_start_ms: int = 0
+        self._volume_5m_avg: float = 0.0
     
     async def _subscribe(self) -> None:
         """No explicit subscription needed for URL-based streams."""
         self.logger.info("Subscribed to aggTrade stream", symbol=self.symbol)
+    
+    def _update_volume(self, quantity: float, timestamp_ms: int) -> None:
+        """Update rolling volume with 1-minute current and 5-minute average."""
+        # Add to rolling buffer
+        self._volume_buffer.append(VolumeEntry(
+            timestamp_ms=timestamp_ms,
+            volume=quantity,
+        ))
+        
+        # Clean up old entries
+        cutoff_ms = timestamp_ms - self._volume_buffer_max_age_ms
+        while self._volume_buffer and self._volume_buffer[0].timestamp_ms < cutoff_ms:
+            self._volume_buffer.popleft()
+        
+        # Calculate 1-minute volume (last 60 seconds)
+        cutoff_1m = timestamp_ms - 60_000
+        self._volume_1m = sum(
+            e.volume for e in self._volume_buffer 
+            if e.timestamp_ms >= cutoff_1m
+        )
+        
+        # Calculate 5-minute average (volume per minute over 5 minutes)
+        if len(self._volume_buffer) >= 2:
+            total_volume = sum(e.volume for e in self._volume_buffer)
+            time_span_ms = self._volume_buffer[-1].timestamp_ms - self._volume_buffer[0].timestamp_ms
+            if time_span_ms > 0:
+                minutes = time_span_ms / 60_000
+                self._volume_5m_avg = total_volume / max(minutes, 1.0)
+            else:
+                self._volume_5m_avg = total_volume
+        else:
+            self._volume_5m_avg = self._volume_1m
     
     async def _handle_message(self, message: str) -> None:
         """Parse aggregated trade message."""
@@ -178,12 +249,7 @@ class BinanceAggTradeFeed(BaseFeed):
                 local_time_ms = int(time.time() * 1000)
                 
                 # Update rolling volume
-                current_window_start = trade_time_ms - (trade_time_ms % 60000)
-                if current_window_start != self._volume_window_start_ms:
-                    self._volume_1m = quantity
-                    self._volume_window_start_ms = current_window_start
-                else:
-                    self._volume_1m += quantity
+                self._update_volume(quantity, trade_time_ms)
                 
                 # Add to price buffer
                 self.price_buffer.add(
@@ -222,6 +288,7 @@ class BinanceAggTradeFeed(BaseFeed):
             velocity_30s=self.price_buffer.get_velocity(30),
             volatility_30s=self.price_buffer.get_volatility(30),
             volume_1m=self._volume_1m,
+            volume_5m_avg=self._volume_5m_avg,
             atr_5m=self.price_buffer.get_atr(300, 60),
             max_move_10s_pct=self.price_buffer.get_max_move_in_subwindow(30, 10),
         )
