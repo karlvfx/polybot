@@ -100,7 +100,7 @@ class SignalSettings(BaseSettings):
     # ==========================================================================
     # Spot movement thresholds (supporting filter)
     # ==========================================================================
-    min_spot_move_pct: float = 0.003  # 0.3% absolute minimum (lowered from 0.7%)
+    min_spot_move_pct: float = 0.001  # 0.1% minimum (lowered further)
     atr_multiplier: float = 1.5  # move_threshold = max(0.7%, 1.5 * ATR)
     
     # Escape clause thresholds (allows sub-threshold moves when strongly supported)
@@ -115,7 +115,7 @@ class SignalSettings(BaseSettings):
     volume_surge_threshold: float = 0.0  # DISABLED - volume tracking broken (always <1.0x)
     
     # Spike concentration (anti-drift filter)
-    spike_concentration_threshold: float = 0.30  # 30% of move in sharpest 10s (lowered significantly)
+    spike_concentration_threshold: float = 0.0  # DISABLED - always 0% (calculation broken)
     
     # Volatility filter
     max_volatility_30s: float = 0.008  # 0.8% - slightly higher tolerance
@@ -128,7 +128,7 @@ class SignalSettings(BaseSettings):
     min_mispricing_pct: float = 0.03  # 3% mispricing required
     
     # Liquidity
-    min_liquidity_eur: float = 50.0  # EUR at best price
+    min_liquidity_eur: float = 10.0  # EUR at best price (lowered for testing)
     liquidity_collapse_threshold: float = 0.60  # Alert if <60% of 30s ago
 
 
