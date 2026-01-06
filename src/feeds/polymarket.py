@@ -1160,7 +1160,7 @@ class PolymarketFeed:
             self.logger.error("No market_id provided and auto_discover is disabled")
             return False
         
-        self.logger.info("Discovering BTC 15-minute market...")
+        self.logger.info(f"Discovering {self.asset} 15-minute market...")
         
         try:
             market = await self._discovery.get_current_market()
@@ -1192,7 +1192,7 @@ class PolymarketFeed:
                     )
                 return True
             else:
-                self.logger.warning("No BTC 15-minute markets found - will retry")
+                self.logger.warning(f"No {self.asset} 15-minute markets found - will retry")
                 return False
                 
         except Exception as e:
