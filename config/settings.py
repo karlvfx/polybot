@@ -112,7 +112,7 @@ class SignalSettings(BaseSettings):
     escape_clause_confidence_penalty: float = 0.10  # 10% confidence penalty
     
     # Volume authentication (prevents wash trading/fake breakouts)
-    volume_surge_threshold: float = 1.0  # Disabled (1.0x = no requirement) - fix volume tracking later
+    volume_surge_threshold: float = 0.0  # DISABLED - volume tracking broken (always <1.0x)
     
     # Spike concentration (anti-drift filter)
     spike_concentration_threshold: float = 0.30  # 30% of move in sharpest 10s (lowered significantly)
