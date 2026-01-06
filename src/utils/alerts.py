@@ -33,31 +33,20 @@ class DiscordAlerter:
         self.webhook_url = webhook_url
         self.logger = logger.bind(component="discord_alerter")
         self._rate_limit_until: float = 0
-        self._client: Optional[httpx.AsyncClient] = None
         self._consecutive_failures = 0
     
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create a reusable HTTP client with proper timeouts."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=15.0,   # Connection timeout (increased for slow networks)
-                    read=20.0,      # Read timeout
-                    write=15.0,     # Write timeout
-                    pool=10.0,      # Pool timeout
-                ),
-                limits=httpx.Limits(
-                    max_keepalive_connections=5,
-                    max_connections=10,
-                ),
-            )
-        return self._client
+    def _get_timeout(self) -> httpx.Timeout:
+        """Get timeout configuration."""
+        return httpx.Timeout(
+            connect=30.0,   # Connection timeout (increased significantly)
+            read=30.0,      # Read timeout
+            write=30.0,     # Write timeout
+            pool=30.0,      # Pool timeout
+        )
     
     async def close(self):
-        """Close the HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        """Close the HTTP client (no-op now, using fresh clients)."""
+        pass
     
     # ==========================================================================
     # Core Methods
@@ -84,11 +73,12 @@ class DiscordAlerter:
         
         for attempt in range(self.MAX_RETRIES):
             try:
-                client = await self._get_client()
-                response = await client.post(
-                    self.webhook_url,
-                    json=payload,
-                )
+                # Use fresh client per request to avoid stale connection issues
+                async with httpx.AsyncClient(timeout=self._get_timeout()) as client:
+                    response = await client.post(
+                        self.webhook_url,
+                        json=payload,
+                    )
                 
                 if response.status_code == 429:
                     retry_after = response.json().get("retry_after", 5)
