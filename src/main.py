@@ -469,32 +469,42 @@ class TradingBot:
                                     price = "connecting..."
                                     price_emoji = "⏳"
                                 
-                                # Get PM status - check both data and discovered market
+                                # Get PM status with divergence metrics
                                 pm_info = "N/A"
+                                divergence_info = ""
                                 if asset_feeds.polymarket:
                                     pm_data = asset_feeds.polymarket.get_data()
                                     discovered = asset_feeds.polymarket._discovered_market
                                     if pm_data and pm_data.yes_bid > 0:
                                         pm_info = f"YES:{pm_data.yes_bid:.2f} NO:{pm_data.no_bid:.2f}"
+                                        
+                                        # Calculate divergence (the actual edge signal)
+                                        if consensus and consensus.move_30s_pct != 0:
+                                            import math
+                                            spot_implied = 1 / (1 + math.exp(-consensus.move_30s_pct * 100))
+                                            divergence = abs(spot_implied - pm_data.yes_bid)
+                                            pm_age = pm_data.orderbook_age_seconds
+                                            
+                                            # Show divergence status
+                                            if divergence >= 0.08 and pm_age >= 8:
+                                                divergence_info = f" 🎯 DIV:{divergence:.0%} AGE:{pm_age:.0f}s"
+                                            elif pm_age >= 8:
+                                                divergence_info = f" ⏳ AGE:{pm_age:.0f}s"
+                                            else:
+                                                divergence_info = f" ({pm_age:.0f}s)"
+                                        else:
+                                            pm_age = pm_data.orderbook_age_seconds
+                                            divergence_info = f" ({pm_age:.0f}s)"
                                     elif discovered:
                                         pm_info = f"Market found (loading...)"
                                     else:
                                         pm_info = "No market"
                                 
-                                # Get oracle status
-                                oracle_info = "N/A"
-                                if asset_feeds.chainlink:
-                                    oracle_data = asset_feeds.chainlink.get_data()
-                                    if oracle_data:
-                                        oracle_info = f"${oracle_data.current_value:,.0f} ({oracle_data.oracle_age_seconds:.0f}s)"
-                                    else:
-                                        oracle_info = "connecting..."
-                                
-                                asset_status_lines.append(f"  {asset}: {price_emoji} {price}")
-                                asset_status_lines.append(f"      PM: {pm_info}")
-                                asset_status_lines.append(f"      Oracle: {oracle_info}")
+                                # Build status line (no Oracle - we use divergence now)
+                                asset_status_lines.append(f"  **{asset}**: {price_emoji} {price}")
+                                asset_status_lines.append(f"      PM: {pm_info}{divergence_info}")
                             else:
-                                asset_status_lines.append(f"  {asset}: ❌ Not initialized")
+                                asset_status_lines.append(f"  **{asset}**: ❌ Not initialized")
                     
                     # Fallback to single-asset status
                     pm_status = "Not initialized"
