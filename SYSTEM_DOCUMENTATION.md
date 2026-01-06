@@ -458,30 +458,35 @@ if divergence >= 0.08 and pm_age >= 8s and pm_age <= 30s:
 
 #### Primary Conditions (All Must Pass)
 
-1. **Divergence Threshold** (PRIMARY)
+1. **Divergence Threshold** (PRIMARY) ✅ ACTIVE
    - Spot-implied prob differs from PM odds by ≥8%
    - This is the core signal
 
-2. **PM Staleness Window** (PRIMARY)
-   - PM orderbook unchanged for 8-30 seconds
-   - Too fresh (<8s): MM might be about to update
-   - Too stale (>30s): Opportunity likely passed
+2. **PM Staleness Window** ⚠️ RELAXED
+   - Currently: 0s - 600s (effectively disabled for testing)
+   - Original: 8-30 seconds
 
-3. **Movement Threshold**
-   - Base: 0.7% minimum spot move in 30s
+3. **Movement Threshold** ⚠️ LOWERED
+   - Currently: 0.05% minimum (lowered for testing)
+   - Original: 0.7% minimum spot move in 30s
 
-4. **Volume Authentication**
-   - Current volume ≥ 1.5× 5-minute average
+4. **Volume Authentication** ❌ DISABLED
+   - Currently: Threshold set to 0.0x (always passes)
+   - Issue: Volume surge calculation always returned <1.0x
+   - To fix: Investigate volume baseline calculation
 
-5. **Spike Concentration**
-   - ≥50% of move in sharpest 10-second window
+5. **Spike Concentration** ❌ DISABLED
+   - Currently: Threshold set to 0% (always passes)
+   - Issue: Spike concentration always returned 0%
+   - To fix: Investigate spike detection algorithm
 
-6. **Exchange Agreement**
+6. **Exchange Agreement** ✅ ACTIVE
    - Agreement score ≥ 0.80
 
-7. **Liquidity Checks**
-   - Minimum €50 at best price
-   - No liquidity collapse (>40% drop in 30s)
+7. **Liquidity Checks** ⚠️ LOWERED
+   - Currently: €1 minimum (lowered for testing)
+   - Original: €50 at best price
+   - Liquidity collapse detection still active
 
 #### Escape Clause
 
@@ -747,15 +752,20 @@ class Settings(BaseSettings):
 
 ### Key Thresholds
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `min_spot_move_pct` | 0.7% | Minimum price movement |
-| `volume_surge_threshold` | 2.0x | Required volume surge |
-| `spike_concentration_threshold` | 60% | Move concentration in 10s |
-| `min_mispricing_pct` | 3% | Minimum odds mispricing |
-| `min_liquidity_eur` | €50 | Minimum liquidity |
+| Setting | Current Value | Description |
+|---------|---------------|-------------|
+| `min_divergence_pct` | 8% | Minimum spot-PM probability divergence |
+| `min_pm_staleness_seconds` | 0s | PM staleness minimum (DISABLED) |
+| `max_pm_staleness_seconds` | 600s | PM staleness maximum |
+| `min_spot_move_pct` | 0.05% | Minimum price movement (lowered for testing) |
+| `volume_surge_threshold` | 0.0x | DISABLED (calculation broken) |
+| `spike_concentration_threshold` | 0% | DISABLED (calculation broken) |
+| `min_liquidity_eur` | €1 | Minimum liquidity (lowered for testing) |
+| `min_agreement_score` | 80% | Exchange agreement quality |
 | `alert_confidence_threshold` | 70% | Min confidence for alerts |
 | `night_mode_min_confidence` | 85% | Min confidence for auto trades |
+
+**Note**: Volume surge and spike concentration filters are currently disabled due to calculation issues. They will be fixed in a future update.
 
 ---
 
@@ -970,7 +980,7 @@ polybot/
 
 ## Roadmap
 
-### Current Status (v1.0)
+### Current Status (v1.1 - January 2026)
 
 ✅ Multi-asset support (BTC, ETH, SOL)  
 ✅ Virtual trading with P&L tracking  
@@ -978,9 +988,39 @@ polybot/
 ✅ Orderbook imbalance detection  
 ✅ Market quality scoring  
 ✅ Auto market discovery  
+✅ VPS deployment guide  
+✅ Signal rejection logging (INFO level)  
+
+### Recent Changes (v1.1)
+
+**Signal Detection Tuning:**
+- Volume surge filter: **DISABLED** (was always <1.0x due to calculation issue)
+- Spike concentration filter: **DISABLED** (was always 0%)
+- PM staleness minimum: **DISABLED** (PM updates faster than expected)
+- PM staleness maximum: Increased to 600s
+- Min spot move: Lowered to 0.05% (testing)
+- Min liquidity: Lowered to €1 (testing)
+
+**Discord Alerter Improvements:**
+- Fresh HTTP client per request (avoids stale connection issues)
+- Timeout increased to 30s for all operations
+- Better retry logic with exponential backoff
+
+**Logging Improvements:**
+- Signal rejections now logged at INFO level (visible in normal logs)
+- Shows exactly which filter blocked each signal
+- 30-second rejection stats summary
+
+**VPS Deployment:**
+- Complete VPS setup guide added (VPS_SETUP.md)
+- Hetzner CX22 recommended (€4.35/mo)
+- Systemd service for auto-restart
+- Convenience aliases for management
 
 ### Future Enhancements
 
+- [ ] Fix volume surge calculation (currently disabled)
+- [ ] Fix spike concentration calculation (currently disabled)
 - [ ] Historical backtesting module
 - [ ] Machine learning signal enhancement
 - [ ] Additional assets (DOGE, AVAX, etc.)
