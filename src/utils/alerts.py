@@ -25,9 +25,9 @@ class DiscordAlerter:
     - Error alerts
     """
     
-    # Retry settings
-    MAX_RETRIES = 3
-    RETRY_DELAYS = [1, 2, 5]  # seconds between retries
+    # Retry settings - keep it fast to not block bot
+    MAX_RETRIES = 2  # Reduced from 3
+    RETRY_DELAYS = [0.5, 1.0]  # Faster retries
     
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
@@ -36,12 +36,12 @@ class DiscordAlerter:
         self._consecutive_failures = 0
     
     def _get_timeout(self) -> httpx.Timeout:
-        """Get timeout configuration."""
+        """Get timeout configuration - keep short to not block bot."""
         return httpx.Timeout(
-            connect=30.0,   # Connection timeout (increased significantly)
-            read=30.0,      # Read timeout
-            write=30.0,     # Write timeout
-            pool=30.0,      # Pool timeout
+            connect=5.0,   # Fast connection timeout
+            read=5.0,      # Fast read timeout
+            write=5.0,     # Fast write timeout
+            pool=5.0,      # Fast pool timeout
         )
     
     async def close(self):

@@ -573,25 +573,25 @@ class TradingBot:
                         total_signals = summary.get("signals", {}).get("total", 0)
                         signal_stats = f"\n**Signals:** {total_signals} detected this session"
                     
-                    # Build final status message
+                    # Build final status message (NON-BLOCKING - don't let Discord slow down bot)
                     if asset_status_lines:
                         # Multi-asset format
-                        await self.alerter.send_message(
+                        asyncio.create_task(self.alerter.send_message(
                             f"📊 **Status Update**\n"
                             f"**Assets:**\n" + "\n".join(asset_status_lines) +
                             f"{mode_status}"
                             f"{signal_stats}"
-                        )
+                        ))
                     else:
                         # Legacy single-asset format
-                        await self.alerter.send_message(
+                        asyncio.create_task(self.alerter.send_message(
                             f"📊 **Status Update**\n"
                             f"**Exchanges:**\n" + "\n".join(f"  {s}" for s in exchange_status) + "\n"
                             f"**Polymarket:** {pm_status}\n"
                             f"**Oracle:** {oracle_status}"
                             f"{mode_status}"
                             f"{signal_stats}"
-                        )
+                        ))
                 
                 await asyncio.sleep(10)  # Check health every 10 seconds
                 
