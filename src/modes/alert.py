@@ -226,10 +226,11 @@ class AlertMode(BaseMode):
         
         # Open virtual position if virtual trader is available
         virtual_position_opened = False
-        if self._virtual_trader and self._polymarket_feed:
+        if self._virtual_trader:
             try:
-                pm_data = self._polymarket_feed.get_data()
-                if pm_data:
+                # Use PM data from the signal (correct asset), not from primary feed
+                pm_data = signal.polymarket
+                if pm_data and pm_data.yes_ask > 0:
                     position = await self._virtual_trader.open_virtual_position(
                         signal=signal,
                         market_id=signal.market_id,
