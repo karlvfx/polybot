@@ -266,6 +266,19 @@ class VirtualTrader:
             )
             return None  # Return None instead of broken position
         
+        # SAFETY CHECK: Don't trade at extreme prices (< 15% or > 85%)
+        # At these levels, small $0.01 moves cause huge % losses
+        MIN_SAFE_PRICE = 0.15
+        MAX_SAFE_PRICE = 0.85
+        if entry_price < MIN_SAFE_PRICE or entry_price > MAX_SAFE_PRICE:
+            self.logger.warning(
+                "Entry price too extreme - skipping position",
+                side=side,
+                entry_price=f"${entry_price:.3f}",
+                safe_range=f"${MIN_SAFE_PRICE:.2f}-${MAX_SAFE_PRICE:.2f}",
+            )
+            return None
+        
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
         
@@ -429,8 +442,21 @@ class VirtualTrader:
         if current_pnl_pct >= self.take_profit_pct:
             return "take_profit"
         
-        # EXIT 4: Stop loss
-        if current_pnl_pct <= self.stop_loss_pct:
+        # EXIT 4: Stop loss (dynamic based on entry price)
+        # At low prices (e.g., $0.20), a $0.02 move = -10% - need wider stop
+        # At mid prices (e.g., $0.50), a $0.02 move = -4% - normal stop
+        # Use absolute price-based stop: allow $0.03 adverse move
+        ABSOLUTE_STOP_MOVE = 0.03  # Max $0.03 adverse move allowed
+        
+        if position.entry_price > 0:
+            # Calculate what % the absolute move represents at this entry
+            dynamic_stop_pct = -ABSOLUTE_STOP_MOVE / position.entry_price
+            # Clamp to reasonable range (-5% to -15%)
+            dynamic_stop_pct = max(-0.15, min(-0.05, dynamic_stop_pct))
+        else:
+            dynamic_stop_pct = self.stop_loss_pct
+        
+        if current_pnl_pct <= dynamic_stop_pct:
             return "stop_loss"
         
         # EXIT 5: Time limit (standard)

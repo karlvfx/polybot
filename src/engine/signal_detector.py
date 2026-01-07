@@ -420,6 +420,20 @@ class SignalDetector:
             )
             return None
         
+        # EARLY CHECK: Reject extreme prices (outside 15%-85% range)
+        # At extreme odds, small price moves cause huge % losses
+        # E.g., at $0.04 (4%), a $0.01 move = -25% loss!
+        MIN_TRADEABLE_PRICE = 0.15  # Don't trade if YES < 15%
+        MAX_TRADEABLE_PRICE = 0.85  # Don't trade if YES > 85%
+        
+        if pm_data.yes_bid < MIN_TRADEABLE_PRICE and pm_data.no_bid < MIN_TRADEABLE_PRICE:
+            self.logger.debug(
+                "Both sides at extreme prices - skipping",
+                yes_bid=pm_data.yes_bid,
+                no_bid=pm_data.no_bid,
+            )
+            return None
+        
         # Calculate divergence (core signal)
         divergence_data = self.calculate_divergence(consensus, pm_data)
         
