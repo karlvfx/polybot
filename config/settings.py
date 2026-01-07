@@ -136,18 +136,21 @@ class ConfidenceWeights(BaseSettings):
     """
     Confidence scoring component weights.
     
-    NEW: Divergence-based weights (spot-PM divergence is primary signal).
+    NEW: Divergence-based weights with fee-aware scoring (Jan 2026 fee update).
     """
     
-    # Primary signals (60% total)
-    divergence_weight: float = 0.40      # Spot-PM divergence magnitude
+    # Primary signals (55% total)
+    divergence_weight: float = 0.35      # Spot-PM divergence magnitude
     pm_staleness_weight: float = 0.20    # Orderbook age (stale = opportunity)
     
     # Supporting factors (40% total)
-    consensus_strength_weight: float = 0.15
-    liquidity_weight: float = 0.10
-    volume_surge_weight: float = 0.08
-    spike_concentration_weight: float = 0.07
+    consensus_strength_weight: float = 0.12
+    liquidity_weight: float = 0.08
+    volume_surge_weight: float = 0.05
+    spike_concentration_weight: float = 0.05
+    
+    # Fee-aware scoring (5%) - favors maker orders
+    maker_advantage_weight: float = 0.05
     
     # Legacy weights (kept at 0 for backward compatibility)
     oracle_age_weight: float = 0.0       # No longer used as primary signal

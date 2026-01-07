@@ -781,6 +781,12 @@ class PolymarketFeed:
         self._last_no_bid: float = 0.0
         self._last_no_ask: float = 0.0
         self._last_price_change_ms: int = 0  # When any price last changed
+        
+        # NEW: Fee tracking (Jan 2026 Polymarket fee update)
+        self._yes_fee_rate_bps: int = 0
+        self._no_fee_rate_bps: int = 0
+        self._fee_rate_fetched_at: float = 0.0
+        self._fee_rate_ttl: float = 60.0  # Refresh fee rates every 60 seconds
     
     def add_callback(self, callback: Callable[[PolymarketData], None]) -> None:
         """Register a callback for orderbook updates."""
@@ -810,12 +816,80 @@ class PolymarketFeed:
                 yes_token=self._yes_token_id[:20] + "..." if self._yes_token_id else None,
                 no_token=self._no_token_id[:20] + "..." if self._no_token_id else None,
             )
+            
+            # Fetch initial fee rates
+            await self._fetch_fee_rates()
+            
             return True
         except Exception as e:
             self.health.connected = False
             self.health.error_count += 1
             self.logger.error("Connection failed", error=str(e))
             return False
+    
+    async def _fetch_fee_rate(self, token_id: str) -> int:
+        """
+        Fetch dynamic fee rate for a specific token.
+        
+        Returns: fee_rate_bps (e.g., 1000 = 0.1%)
+        """
+        if not self._http_client or not token_id:
+            return 0
+        
+        try:
+            response = await self._http_client.get(
+                f"{self.CLOB_API_URL}/fee-rate",
+                params={"token_id": token_id},
+                timeout=5.0,
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                fee_rate_bps = data.get("fee_rate_bps", 0)
+                return int(fee_rate_bps)
+            else:
+                self.logger.debug("Fee rate fetch failed", status=response.status_code)
+                return 0
+                
+        except Exception as e:
+            self.logger.debug("Fee rate fetch error", error=str(e))
+            return 0
+    
+    async def _fetch_fee_rates(self) -> None:
+        """
+        Fetch fee rates for both YES and NO tokens.
+        Caches results for _fee_rate_ttl seconds.
+        """
+        now = time.time()
+        
+        # Skip if recently fetched
+        if now - self._fee_rate_fetched_at < self._fee_rate_ttl:
+            return
+        
+        if not self._yes_token_id or not self._no_token_id:
+            return
+        
+        try:
+            # Fetch both fee rates in parallel
+            yes_fee, no_fee = await asyncio.gather(
+                self._fetch_fee_rate(self._yes_token_id),
+                self._fetch_fee_rate(self._no_token_id),
+            )
+            
+            self._yes_fee_rate_bps = yes_fee
+            self._no_fee_rate_bps = no_fee
+            self._fee_rate_fetched_at = now
+            
+            self.logger.info(
+                "Fetched fee rates",
+                yes_fee_bps=yes_fee,
+                no_fee_bps=no_fee,
+                yes_fee_pct=f"{yes_fee/100:.2f}%",
+                no_fee_pct=f"{no_fee/100:.2f}%",
+            )
+            
+        except Exception as e:
+            self.logger.warning("Failed to fetch fee rates", error=str(e))
     
     async def _fetch_token_ids(self) -> bool:
         """Fetch clobTokenIds for the market."""
@@ -1058,9 +1132,14 @@ class PolymarketFeed:
             orderbook_imbalance_ratio=imbalance_ratio,
             yes_depth_total=yes_depth_total,
             no_depth_total=no_depth_total,
-            # NEW: Staleness tracking for divergence strategy
+            # Staleness tracking for divergence strategy
             last_price_change_ms=self._last_price_change_ms,
             orderbook_age_seconds=orderbook_age_seconds,
+            # Fee tracking (Jan 2026 update)
+            yes_token_id=self._yes_token_id or "",
+            no_token_id=self._no_token_id or "",
+            yes_fee_rate_bps=self._yes_fee_rate_bps,
+            no_fee_rate_bps=self._no_fee_rate_bps,
         )
     
     async def _poll_orderbook(self) -> bool:
@@ -1114,6 +1193,9 @@ class PolymarketFeed:
                     if not await self._connect():
                         await asyncio.sleep(1)
                         continue
+                
+                # Refresh fee rates periodically (every 60s, handled by TTL in method)
+                await self._fetch_fee_rates()
                 
                 # Poll orderbook
                 success = await self._poll_orderbook()

@@ -281,7 +281,56 @@ class SignalDetector:
             )
             return False, RejectionReason.INSUFFICIENT_MOVE
         
+        # Fee viability check (Jan 2026 Polymarket fee update)
+        # Ensure expected edge exceeds effective fees with safety margin
+        if not self._check_fee_viability(divergence_data, pm_data):
+            return False, RejectionReason.FEE_UNFAVORABLE
+        
         return True, None
+    
+    def _check_fee_viability(
+        self,
+        divergence_data: DivergenceData,
+        pm_data: PolymarketData,
+    ) -> bool:
+        """
+        Ensure signal's edge exceeds effective fees.
+        
+        Polymarket fee structure (Jan 2026):
+        - Takers: 0.25% base rate squared by price (peaks 1.6-3% at 50% odds)
+        - Makers: 0% fee + daily rebate
+        
+        Returns True if edge justifies trade, considering fees.
+        """
+        side = "YES" if divergence_data.signal_direction == "UP" else "NO"
+        entry_price = pm_data.yes_bid if side == "YES" else pm_data.no_bid
+        
+        # Calculate taker fee (worst case)
+        taker_fee = pm_data.calculate_effective_fee(side, entry_price, is_maker=False)
+        
+        # Skip check if no fee data available (assume viable)
+        if pm_data.yes_fee_rate_bps == 0 and pm_data.no_fee_rate_bps == 0:
+            return True
+        
+        # Expected edge from divergence (conservative: 50% of divergence)
+        expected_edge = divergence_data.divergence * 0.5
+        
+        # Require edge > 2x taker fee (safety margin)
+        required_edge = taker_fee * 2
+        
+        viable = expected_edge >= required_edge
+        
+        if not viable:
+            self._track_rejection("fee_unfavorable")
+            self.logger.info(
+                "❌ Rejected: Fee structure unfavorable",
+                expected_edge=f"{expected_edge:.2%}",
+                taker_fee=f"{taker_fee:.2%}",
+                required_edge=f"{required_edge:.2%}",
+                entry_price=f"{entry_price:.3f}",
+            )
+        
+        return viable
     
     # ==========================================================================
     # Main Detection Methods

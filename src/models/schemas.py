@@ -65,8 +65,9 @@ class RejectionReason(str, Enum):
     HISTORICAL_WIN_RATE_LOW = "historical_win_rate_low"
     SLIPPAGE_TOO_HIGH = "slippage_too_high"
     GAS_TOO_HIGH = "gas_too_high"
-    CONFIDENCE_TOO_LOW = "confidence_too_low"
+    FEE_UNFAVORABLE = "fee_unfavorable"  # Edge doesn't exceed effective fees
     VOLATILITY_TOO_HIGH = "volatility_too_high"
+    CONFIDENCE_TOO_LOW = "confidence_too_low"
     FEED_STALE = "feed_stale"
 
 
@@ -204,6 +205,55 @@ class PolymarketData:
     last_price_change_ms: int = 0  # When YES/NO prices last changed
     orderbook_age_seconds: float = 0.0  # Seconds since last price change
     
+    # NEW: Fee tracking (Polymarket fee update Jan 2026)
+    yes_token_id: str = ""
+    no_token_id: str = ""
+    yes_fee_rate_bps: int = 0  # e.g., 1000 = 0.1% base rate
+    no_fee_rate_bps: int = 0
+    
+    @property
+    def yes_fee_pct(self) -> float:
+        """Convert bps to percentage (decimal)."""
+        return self.yes_fee_rate_bps / 10000
+    
+    @property
+    def no_fee_pct(self) -> float:
+        """Convert bps to percentage (decimal)."""
+        return self.no_fee_rate_bps / 10000
+    
+    def calculate_effective_fee(self, side: str, price: float, is_maker: bool = False) -> float:
+        """
+        Calculate effective fee for a trade.
+        
+        Fee structure (Jan 2026):
+        - Makers: 0% fee + daily rebate
+        - Takers: 0.25% base rate squared by price
+          - For YES: effective_fee = base_fee * price
+          - For NO: effective_fee = base_fee * (1 - price)
+        
+        Args:
+            side: "YES" or "NO"
+            price: Entry price (0.0 - 1.0)
+            is_maker: If True, return 0 (maker gets rebate)
+        
+        Returns:
+            Effective fee as decimal (e.g., 0.016 = 1.6%)
+        """
+        if is_maker:
+            return 0.0  # Makers pay no fees
+        
+        # Get base fee rate
+        base_fee_bps = self.yes_fee_rate_bps if side == "YES" else self.no_fee_rate_bps
+        base_fee = base_fee_bps / 10000  # Convert to decimal
+        
+        # Fee is squared by price
+        if side == "YES":
+            effective_fee = base_fee * price
+        else:
+            effective_fee = base_fee * (1 - price)
+        
+        return effective_fee
+    
     def get_orderbook_age_ms(self) -> int:
         """Get milliseconds since last orderbook price change."""
         import time
@@ -238,15 +288,18 @@ class DivergenceData:
 @dataclass
 class ConfidenceBreakdown:
     """Breakdown of confidence score components."""
-    # NEW divergence-based weights (primary signal)
-    divergence: float = 0.0         # 40% - Spot-PM divergence magnitude
+    # Primary signal weights (60%)
+    divergence: float = 0.0         # 35% - Spot-PM divergence magnitude
     pm_staleness: float = 0.0       # 20% - Orderbook age (stale = opportunity)
     
-    # Supporting factors
-    consensus_strength: float = 0.0  # 15% - Exchange agreement quality
-    liquidity: float = 0.0           # 10% - Available depth
-    volume_surge: float = 0.0        # 8%  - Volume authentication
-    spike_concentration: float = 0.0 # 7%  - Move quality (spike vs drift)
+    # Supporting factors (35%)
+    consensus_strength: float = 0.0  # 12% - Exchange agreement quality
+    liquidity: float = 0.0           # 8%  - Available depth
+    volume_surge: float = 0.0        # 5%  - Volume authentication
+    spike_concentration: float = 0.0 # 5%  - Move quality (spike vs drift)
+    
+    # Fee-aware scoring (5%)
+    maker_advantage: float = 0.0     # 5%  - Maker order viability
     
     # Legacy (kept for backwards compatibility, weight=0)
     oracle_age: float = 0.0

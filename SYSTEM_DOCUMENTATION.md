@@ -13,9 +13,10 @@
 9. [Operating Modes](#operating-modes)
 10. [Configuration](#configuration)
 11. [Risk Management](#risk-management)
-12. [Monitoring & Alerting](#monitoring--alerting)
-13. [Performance Metrics](#performance-metrics)
-14. [Technical Details](#technical-details)
+12. [Fee Structure (Jan 2026 Update)](#fee-structure-jan-2026-update)
+13. [Monitoring & Alerting](#monitoring--alerting)
+14. [Performance Metrics](#performance-metrics)
+15. [Technical Details](#technical-details)
 
 ---
 
@@ -818,6 +819,105 @@ class Settings(BaseSettings):
 - Time limit at 90 seconds
 - Emergency exit at 120 seconds
 - Liquidity collapse detection
+
+---
+
+## Fee Structure (Jan 2026 Update)
+
+Polymarket introduced taker-only fees on 15-minute crypto markets. The bot is fully adapted to optimize for this fee structure.
+
+### Fee Mechanics
+
+| Order Type | Fee | Notes |
+|------------|-----|-------|
+| **Maker (Limit Orders)** | 0% + Daily Rebate | ~0.5-2% daily rebate based on volume |
+| **Taker (Market Orders)** | 0.25% base rate squared by price | Peaks at 50% odds (1.6-3%) |
+
+### Effective Taker Fees by Odds
+
+| Entry Price | YES Taker Fee | NO Taker Fee |
+|-------------|---------------|--------------|
+| 0.20 (20%) | ~0.20% | ~0.80% |
+| 0.30 (30%) | ~0.30% | ~0.70% |
+| 0.50 (50%) | ~1.25% | ~1.25% |
+| 0.70 (70%) | ~0.70% | ~0.30% |
+| 0.80 (80%) | ~0.80% | ~0.20% |
+
+**Key Insight**: The bot naturally operates in low-fee zones (20-80% odds) where fees are 0.2-1.1%.
+
+### Fee-Aware Scoring
+
+The bot includes a **Maker Advantage** component (5% weight) in confidence scoring:
+
+```python
+# Low-fee zone bonus (20-80% odds)
+if 0.20 <= entry_price <= 0.80:
+    score += 1.0  # Maximum bonus
+
+# Spread tightness (maker viability)
+if spread < 0.02:  # <2%
+    score += 1.0  # Easy to make
+
+# Taker fee avoidance
+if taker_fee > 0.015:  # >1.5%
+    score += 1.0  # High value to be maker
+```
+
+### Fee Viability Check
+
+Signals are rejected if expected edge doesn't exceed fees with safety margin:
+
+```python
+# Expected edge from divergence (conservative: 50%)
+expected_edge = divergence * 0.5
+
+# Require edge > 2x taker fee (safety margin)
+required_edge = taker_fee * 2
+
+if expected_edge < required_edge:
+    reject_signal("fee_unfavorable")
+```
+
+### Virtual Trading Fee Simulation
+
+Virtual trades include full fee simulation:
+
+1. **Entry Fee Calculation**:
+   - Maker if spread < 3% AND orderbook stale > 8s
+   - Taker otherwise
+
+2. **Exit Fee Calculation**:
+   - Maker if position held > 60s AND spread < 3%
+   - Taker otherwise
+
+3. **Rebate Estimation**:
+   - ~0.5% per maker leg per day (prorated)
+
+4. **Net P&L**:
+   ```
+   Net P&L = Gross P&L - Entry Fee - Exit Fee + Rebate
+   ```
+
+### Performance Tracking
+
+The bot tracks fee impact:
+
+| Metric | Description |
+|--------|-------------|
+| `gross_pnl` | P&L before fees |
+| `total_fees_paid` | Sum of all entry/exit fees |
+| `total_rebates_earned` | Estimated maker rebates |
+| `net_pnl` | Final P&L after fees |
+| `fee_drag_pct` | % of gross P&L lost to fees |
+| `rebate_recovery_pct` | % of fees recovered via rebates |
+| `maker_ratio` | % of trades executed as maker |
+
+### Fee Optimization Tips
+
+1. **Avoid 50% odds entries** (0.45-0.55 price range) - fees peak at 1.6-3%
+2. **Prefer limit orders** - maker orders pay 0% fees and earn rebates
+3. **Target 70-80% odds exits** - lower fees on profitable exits
+4. **Account for fees in take-profit** - 10% TP (not 8%) to cover fees
 
 ---
 

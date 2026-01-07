@@ -184,6 +184,57 @@ class ConfidenceScorer:
         
         return min(1.0, (concentration - 0.4) / 0.3)
     
+    def _score_maker_advantage(
+        self,
+        pm_data,  # PolymarketData
+        direction: str,
+    ) -> float:
+        """
+        Score based on maker order viability (0.0 - 1.0).
+        
+        Polymarket fee structure (Jan 2026):
+        - Makers: 0% fee + daily rebate (~0.5-2% of volume)
+        - Takers: 0.25% base rate squared by price
+        
+        Higher score = more favorable fee structure.
+        """
+        side = "YES" if direction == "UP" else "NO"
+        current_price = pm_data.yes_bid if side == "YES" else pm_data.no_bid
+        spread = abs(pm_data.yes_ask - pm_data.yes_bid)
+        
+        # Calculate taker fee (what we'd pay if we take)
+        taker_fee = pm_data.calculate_effective_fee(side, current_price, is_maker=False)
+        
+        scores = []
+        
+        # 1. Low-fee zone bonus (20-80% odds = 0.2-1.1% fees)
+        if 0.20 <= current_price <= 0.80:
+            scores.append(1.0)  # Sweet spot
+        elif 0.15 <= current_price <= 0.85:
+            scores.append(0.7)
+        elif 0.45 <= current_price <= 0.55:
+            scores.append(0.2)  # 50% odds = worst fees (1.6-3%)
+        else:
+            scores.append(0.5)
+        
+        # 2. Spread tightness (tight spread = easy to make)
+        if spread < 0.02:  # <2%
+            scores.append(1.0)
+        elif spread < 0.05:  # <5%
+            scores.append(0.7)
+        else:
+            scores.append(0.3)
+        
+        # 3. Taker fee avoidance value (higher fees = more valuable to make)
+        if taker_fee > 0.015:  # >1.5%
+            scores.append(1.0)  # High value to avoid
+        elif taker_fee > 0.010:  # >1.0%
+            scores.append(0.7)
+        else:
+            scores.append(0.5)
+        
+        return sum(scores) / len(scores)
+    
     # ==========================================================================
     # Main Scoring Method
     # ==========================================================================
@@ -241,6 +292,12 @@ class ConfidenceScorer:
         # Spike concentration score (7%)
         spike_score = self._score_spike_concentration(consensus.spike_concentration)
         
+        # Maker advantage score (5%) - NEW: Fee-aware scoring
+        maker_score = self._score_maker_advantage(
+            pm,
+            signal.direction.value if signal.direction else "UP",
+        )
+        
         # Create breakdown
         breakdown = ConfidenceBreakdown(
             divergence=divergence_score,
@@ -249,6 +306,7 @@ class ConfidenceScorer:
             liquidity=liquidity_score,
             volume_surge=volume_score,
             spike_concentration=spike_score,
+            maker_advantage=maker_score,  # NEW
         )
         
         # Calculate weighted confidence
@@ -258,7 +316,8 @@ class ConfidenceScorer:
             self.weights.consensus_strength_weight * consensus_score +
             self.weights.liquidity_weight * liquidity_score +
             self.weights.volume_surge_weight * volume_score +
-            self.weights.spike_concentration_weight * spike_score
+            self.weights.spike_concentration_weight * spike_score +
+            self.weights.maker_advantage_weight * maker_score  # Fee-aware bonus
         )
         
         # Apply escape clause penalty (if applicable)

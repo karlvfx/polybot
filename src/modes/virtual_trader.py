@@ -54,6 +54,20 @@ class VirtualPosition:
     realized_pnl_eur: Optional[float] = None
     realized_pnl_pct: Optional[float] = None
     
+    # Fee tracking (Jan 2026 Polymarket fee update)
+    is_maker_entry: bool = False
+    is_maker_exit: bool = False
+    entry_fee_pct: float = 0.0
+    entry_fee_eur: float = 0.0
+    exit_fee_pct: float = 0.0
+    exit_fee_eur: float = 0.0
+    total_fees_eur: float = 0.0
+    estimated_rebate_eur: float = 0.0  # Maker rebate estimate
+    
+    # Gross vs net P&L
+    gross_pnl_eur: Optional[float] = None  # Before fees
+    net_pnl_eur: Optional[float] = None    # After fees + rebates
+    
     @property
     def is_open(self) -> bool:
         return self.exit_price is None
@@ -98,6 +112,13 @@ class VirtualPerformance:
     
     # Hourly stats
     trades_by_hour: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    
+    # Fee tracking (Jan 2026)
+    total_fees_paid_eur: float = 0.0
+    total_rebates_earned_eur: float = 0.0
+    gross_pnl_eur: float = 0.0  # Before fees
+    maker_trades: int = 0
+    taker_trades: int = 0
     
     @property
     def win_rate(self) -> float:
@@ -216,16 +237,26 @@ class VirtualTrader:
         market_id: str,
         pm_data: PolymarketData,
     ) -> VirtualPosition:
-        """Simulate opening a position."""
+        """Simulate opening a position with fee calculation."""
         
-        # Determine entry price based on direction
-        if signal.direction.value.upper() == "UP":
-            entry_price = pm_data.yes_bid  # We'd buy YES token
+        # Determine entry price and side based on direction
+        side = "YES" if signal.direction.value.upper() == "UP" else "NO"
+        if side == "YES":
+            entry_price = pm_data.yes_ask  # We buy YES at ask
         else:
-            entry_price = pm_data.no_bid  # We'd buy NO token
+            entry_price = pm_data.no_ask  # We buy NO at ask
         
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
+        
+        # Determine if we can make (limit order) vs take (market order)
+        # Make if: spread < 3% AND orderbook has been stale for >8s (time to post limit)
+        spread = abs(pm_data.yes_ask - pm_data.yes_bid)
+        is_maker_entry = spread < 0.03 and pm_data.orderbook_age_seconds > 8
+        
+        # Calculate entry fee (Polymarket fee structure Jan 2026)
+        entry_fee_pct = pm_data.calculate_effective_fee(side, entry_price, is_maker=is_maker_entry)
+        entry_fee_eur = self.position_size_eur * entry_fee_pct
         
         # Create virtual position
         position = VirtualPosition(
@@ -246,6 +277,10 @@ class VirtualTrader:
             spike_concentration_at_entry=signal.consensus.spike_concentration if signal.consensus else 0,
             orderbook_imbalance_at_entry=pm_data.orderbook_imbalance_ratio,
             current_price=entry_price,
+            # Fee tracking
+            is_maker_entry=is_maker_entry,
+            entry_fee_pct=entry_fee_pct,
+            entry_fee_eur=entry_fee_eur,
         )
         
         self.open_positions.append(position)
@@ -255,6 +290,8 @@ class VirtualTrader:
             position_id=position.position_id,
             direction=position.direction,
             entry_price=entry_price,
+            entry_type="MAKER" if is_maker_entry else "TAKER",
+            entry_fee=f"€{entry_fee_eur:.3f} ({entry_fee_pct:.2%})",
             confidence=position.confidence_at_entry,
         )
         
@@ -375,19 +412,63 @@ class VirtualTrader:
         position: VirtualPosition,
         exit_reason: str,
     ) -> None:
-        """Close virtual position and record results."""
+        """Close virtual position and record results with fee simulation."""
+        
+        # Get current PM data for exit fee calculation
+        pm_data = self.polymarket_feed.get_data() if self.polymarket_feed else None
         
         # Mark position as closed
         position.exit_price = position.current_price
         position.exit_time_ms = int(time.time() * 1000)
         position.exit_reason = exit_reason
         
-        # Calculate realized P&L
+        # Determine if exit is maker (limit) or taker (market)
+        # Exit is usually taker (immediate sell), but can be maker if time allows
+        spread = abs(pm_data.yes_ask - pm_data.yes_bid) if pm_data else 0
+        is_maker_exit = position.duration_seconds > 60 and spread < 0.03
+        position.is_maker_exit = is_maker_exit
+        
+        # Calculate exit fee
+        side = "YES" if position.direction == "UP" else "NO"
+        exit_price = position.exit_price or 0
+        if pm_data:
+            exit_fee_pct = pm_data.calculate_effective_fee(side, exit_price, is_maker=is_maker_exit)
+        else:
+            exit_fee_pct = 0
+        exit_fee_eur = position.position_size_eur * exit_fee_pct
+        position.exit_fee_pct = exit_fee_pct
+        position.exit_fee_eur = exit_fee_eur
+        
+        # Calculate total fees
+        position.total_fees_eur = position.entry_fee_eur + exit_fee_eur
+        
+        # Calculate gross P&L (before fees)
         position.realized_pnl_pct = position.current_pnl_pct
-        position.realized_pnl_eur = position.position_size_eur * position.realized_pnl_pct
+        position.gross_pnl_eur = position.position_size_eur * position.realized_pnl_pct
+        
+        # Estimate maker rebate (~0.5% per maker leg per day, capped at actual time)
+        maker_legs = (1 if position.is_maker_entry else 0) + (1 if is_maker_exit else 0)
+        if maker_legs > 0:
+            time_factor = min(1.0, position.duration_seconds / 86400)  # Cap at 1 day
+            position.estimated_rebate_eur = position.position_size_eur * 0.005 * maker_legs * time_factor
+        else:
+            position.estimated_rebate_eur = 0.0
+        
+        # Calculate net P&L (after fees + rebates)
+        position.net_pnl_eur = position.gross_pnl_eur - position.total_fees_eur + position.estimated_rebate_eur
+        position.realized_pnl_eur = position.net_pnl_eur  # Use net for tracking
         
         # Record in performance tracker
         self.performance.record_trade(position)
+        
+        # Update fee-related performance stats
+        self.performance.gross_pnl_eur += position.gross_pnl_eur
+        self.performance.total_fees_paid_eur += position.total_fees_eur
+        self.performance.total_rebates_earned_eur += position.estimated_rebate_eur
+        if position.is_maker_entry or is_maker_exit:
+            self.performance.maker_trades += 1
+        else:
+            self.performance.taker_trades += 1
         
         # Move to closed positions
         if position in self.open_positions:
@@ -402,8 +483,12 @@ class VirtualTrader:
             "Virtual position closed",
             position_id=position.position_id,
             exit_reason=exit_reason,
-            realized_pnl_pct=f"{position.realized_pnl_pct:.2%}",
-            realized_pnl_eur=f"€{position.realized_pnl_eur:.2f}",
+            gross_pnl=f"€{position.gross_pnl_eur:.2f}",
+            total_fees=f"€{position.total_fees_eur:.3f}",
+            rebate=f"€{position.estimated_rebate_eur:.3f}" if position.estimated_rebate_eur > 0 else None,
+            net_pnl=f"€{position.net_pnl_eur:.2f}",
+            entry_type="MAKER" if position.is_maker_entry else "TAKER",
+            exit_type="MAKER" if position.is_maker_exit else "TAKER",
             duration_s=f"{position.duration_seconds:.1f}s",
         )
         
@@ -415,8 +500,13 @@ class VirtualTrader:
                 self.logger.error("Error in position closed callback", error=str(e))
     
     def get_performance_summary(self) -> dict:
-        """Get current virtual trading performance."""
+        """Get current virtual trading performance including fee analysis."""
         perf = self.performance
+        
+        # Calculate fee metrics
+        fee_drag_pct = abs(perf.total_fees_paid_eur / perf.gross_pnl_eur) if perf.gross_pnl_eur != 0 else 0
+        rebate_recovery_pct = perf.total_rebates_earned_eur / perf.total_fees_paid_eur if perf.total_fees_paid_eur > 0 else 0
+        maker_ratio = perf.maker_trades / perf.total_trades if perf.total_trades > 0 else 0
         
         return {
             "total_trades": perf.total_trades,
@@ -432,6 +522,16 @@ class VirtualTrader:
             "worst_streak": perf.worst_streak,
             "exit_reasons": dict(perf.exit_reasons),
             "open_positions": len(self.open_positions),
+            # Fee analysis (Jan 2026 Polymarket fee update)
+            "gross_pnl": perf.gross_pnl_eur,
+            "total_fees_paid": perf.total_fees_paid_eur,
+            "total_rebates_earned": perf.total_rebates_earned_eur,
+            "net_pnl": perf.total_pnl_eur,  # Already net
+            "fee_drag_pct": fee_drag_pct,
+            "rebate_recovery_pct": rebate_recovery_pct,
+            "maker_trades": perf.maker_trades,
+            "taker_trades": perf.taker_trades,
+            "maker_ratio": maker_ratio,
         }
     
     def get_detailed_stats(self) -> dict:
