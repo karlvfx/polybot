@@ -168,9 +168,17 @@ class AlertMode(BaseMode):
     async def process_signal(
         self,
         signal: SignalCandidate,
+        asset: str = "BTC",
     ) -> tuple[ActionData, Optional[OutcomeData]]:
         """Process signal: send alert and open virtual position."""
-        if not signal.scoring or not signal.consensus or not signal.oracle or not signal.polymarket:
+        # Oracle is optional for divergence strategy
+        if not signal.scoring or not signal.consensus or not signal.polymarket:
+            self.logger.warning(
+                "Signal missing required data",
+                has_scoring=signal.scoring is not None,
+                has_consensus=signal.consensus is not None,
+                has_polymarket=signal.polymarket is not None,
+            )
             return ActionData(mode="alert", decision=ActionDecision.ALERT), None
         
         # Track pending alert
@@ -195,12 +203,19 @@ class AlertMode(BaseMode):
                         signal=signal,
                         market_id=signal.market_id,
                         pm_data=pm_data,
+                        asset=asset,
                     )
                     virtual_position_opened = True
+                    self.logger.info(
+                        "Virtual position opened",
+                        asset=asset,
+                        direction=signal.direction.value,
+                        confidence=f"{signal.scoring.confidence:.1%}" if signal.scoring else "N/A",
+                    )
                 else:
                     self.logger.warning("No Polymarket data available for virtual position")
             except Exception as e:
-                self.logger.error("Failed to open virtual position", error=str(e))
+                self.logger.error("Failed to open virtual position", error=str(e), exc_info=True)
         
         # Fallback: Send basic alert if virtual trader not available or failed
         if not virtual_position_opened:

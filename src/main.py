@@ -349,7 +349,7 @@ class TradingBot:
         
         # Process based on mode
         if self.mode and self.mode.should_process(signal):
-            action, outcome = await self.mode.process_signal(signal)
+            action, outcome = await self.mode.process_signal(signal, asset=asset)
             
             # Log complete signal
             log_entry = signal.to_log()

@@ -136,6 +136,7 @@ class NightAutoMode(BaseMode):
     async def process_signal(
         self,
         signal: SignalCandidate,
+        asset: str = "BTC",
     ) -> tuple[ActionData, Optional[OutcomeData]]:
         """
         Execute trade in night auto mode.

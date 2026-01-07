@@ -56,6 +56,7 @@ class ShadowMode(BaseMode):
     async def process_signal(
         self,
         signal: SignalCandidate,
+        asset: str = "BTC",
     ) -> tuple[ActionData, Optional[OutcomeData]]:
         """
         Simulate trade execution and record results.

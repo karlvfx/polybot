@@ -46,6 +46,7 @@ class BaseMode(ABC):
     async def process_signal(
         self,
         signal: SignalCandidate,
+        asset: str = "BTC",
     ) -> tuple[ActionData, Optional[OutcomeData]]:
         """
         Process a validated signal according to mode rules.
