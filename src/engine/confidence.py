@@ -278,7 +278,7 @@ class ConfidenceScorer:
         )
         
         # ======================
-        # Supporting Factors (40%)
+        # Supporting Factors (30%)
         # ======================
         
         # Consensus strength (15%)
@@ -286,23 +286,20 @@ class ConfidenceScorer:
             consensus.agreement_score,
         )
         
-        # Liquidity score (10%)
+        # Liquidity score (15%) - increased weight
         liquidity_score = self._score_liquidity(
             pm.yes_liquidity_best,
             pm.liquidity_30s_ago,
         )
         
-        # Volume surge score (8%)
-        volume_score = self._score_volume_surge(consensus.volume_surge_ratio)
+        # Volume surge score - DISABLED (calculation broken, always <1.0x)
+        volume_score = 0.0  # self._score_volume_surge(consensus.volume_surge_ratio)
         
-        # Spike concentration score (7%)
-        spike_score = self._score_spike_concentration(consensus.spike_concentration)
+        # Spike concentration score - DISABLED (always returns 0%)
+        spike_score = 0.0  # self._score_spike_concentration(consensus.spike_concentration)
         
-        # Maker advantage score (5%) - NEW: Fee-aware scoring
-        maker_score = self._score_maker_advantage(
-            pm,
-            signal.direction.value if signal.direction else "UP",
-        )
+        # Maker advantage score - DISABLED (reduce noise)
+        maker_score = 0.0  # self._score_maker_advantage(...)
         
         # Create breakdown
         breakdown = ConfidenceBreakdown(
