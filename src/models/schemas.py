@@ -260,6 +260,36 @@ class PolymarketData:
         if self.last_price_change_ms == 0:
             return 0
         return int(time.time() * 1000) - self.last_price_change_ms
+    
+    def get_normalized_probabilities(self) -> tuple[float, float, float]:
+        """
+        Normalize YES + NO probabilities and return confidence penalty.
+        
+        Handles the case where YES + NO != 1.0 (stale or corrupted data).
+        
+        Returns:
+            (normalized_yes, normalized_no, confidence_penalty)
+            - confidence_penalty: 1.0 if sum is ~1.0, lower if not
+        """
+        total = self.yes_bid + self.no_bid
+        
+        # Perfect sum
+        if abs(total - 1.0) < 0.01:
+            return self.yes_bid, self.no_bid, 1.0
+        
+        # Slight deviation (1-5%) - normalize with small penalty
+        if abs(total - 1.0) < 0.05:
+            penalty = 1.0 - abs(1.0 - total) * 2  # e.g., 3% off = 6% penalty
+            return self.yes_bid / total, self.no_bid / total, max(0.5, penalty)
+        
+        # Large deviation (>5%) - data is stale/corrupted, heavy penalty
+        penalty = max(0.0, 1.0 - abs(1.0 - total) * 5)  # e.g., 10% off = 50% penalty
+        return self.yes_bid / total, self.no_bid / total, penalty
+    
+    @property
+    def probability_sum_deviation(self) -> float:
+        """How far YES + NO is from 1.0 (should be ~0)."""
+        return abs((self.yes_bid + self.no_bid) - 1.0)
 
 
 @dataclass

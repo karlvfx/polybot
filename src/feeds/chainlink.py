@@ -123,7 +123,7 @@ class ChainlinkFeed:
         feed_address: str,
         rpc_url: str,
         ws_url: Optional[str] = None,
-        poll_interval: float = 2.0,  # 2 second poll (reduce CPU)
+        poll_interval: float = 5.0,  # 5 second poll (oracle is secondary signal)
     ):
         self.feed_address = feed_address
         self.rpc_url = rpc_url
@@ -255,11 +255,41 @@ class ChainlinkFeed:
             return None
     
     async def _poll_loop(self) -> None:
-        """Main polling loop."""
+        """
+        Smart polling loop with adaptive intervals.
+        
+        - Normal: Poll every 5 seconds (reduced from 2s since oracle is secondary)
+        - Near expected update: Poll every 2 seconds
+        - If cache is fresh (<2s): Skip poll
+        """
         while self._running:
             try:
+                current_time_ms = int(time.time() * 1000)
+                
+                # Skip if cache is very fresh (< 2 seconds old)
+                if self._current_data and self.last_poll_ms:
+                    cache_age_ms = current_time_ms - self.last_poll_ms
+                    if cache_age_ms < 2000:
+                        await asyncio.sleep(1)
+                        continue
+                
+                # Check if we're near expected update
+                next_update_ms = self._heartbeat_tracker.estimate_next_update(current_time_ms)
+                time_to_update = (next_update_ms - current_time_ms) / 1000
+                
+                # Poll now
                 await self._poll_oracle()
-                await asyncio.sleep(self.poll_interval)
+                
+                # Adaptive sleep based on expected next update
+                if 0 < time_to_update < 10:
+                    # Near expected update - poll more frequently
+                    await asyncio.sleep(2)
+                else:
+                    # Normal interval - poll less frequently (save RPC calls)
+                    await asyncio.sleep(self.poll_interval)
+                    
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 self.logger.error("Poll loop error", error=str(e))
                 await asyncio.sleep(self.poll_interval * 2)

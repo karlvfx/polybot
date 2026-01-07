@@ -107,21 +107,21 @@ class ConfidenceScorer:
         
         Stale orderbook = opportunity hasn't been arbed yet.
         
-        Window: 8-30 seconds is optimal.
-        - Under 8s: Too fresh, MM might be about to update
-        - 8-15s: Optimal window
-        - 15-30s: Good, but edge may be closing
-        - Over 30s: Opportunity likely passed
+        Window: 15-45 seconds is optimal (based on actual MM behavior).
+        - Under 15s: Too fresh, MM hasn't had time to lag
+        - 15-25s: Optimal window (MM lagging, opportunity exists)
+        - 25-45s: Good, edge may be closing
+        - Over 60s: Opportunity likely passed
         """
-        min_age = settings.signals.min_pm_staleness_seconds
-        optimal_age = 12.0  # Peak confidence at 12 seconds
-        max_age = settings.signals.max_pm_staleness_seconds
+        min_age = settings.signals.min_pm_staleness_seconds  # 15s
+        optimal_age = settings.signals.optimal_pm_staleness_seconds  # 25s
+        max_age = settings.signals.max_pm_staleness_seconds  # 60s
         
         if orderbook_age_seconds < min_age:
-            # Too fresh
+            # Too fresh - MM hasn't had time to lag
             return 0.0
         elif orderbook_age_seconds <= optimal_age:
-            # Ramping up to optimal
+            # Ramping up to optimal (15s → 25s)
             return (orderbook_age_seconds - min_age) / (optimal_age - min_age)
         elif orderbook_age_seconds <= max_age:
             # Ramping down from optimal
@@ -329,6 +329,18 @@ class ConfidenceScorer:
             self.weights.spike_concentration_weight * spike_score +
             self.weights.maker_advantage_weight * maker_score  # Fee-aware bonus
         )
+        
+        # Apply probability normalization penalty (if YES + NO != 1.0)
+        _, _, prob_penalty = pm.get_normalized_probabilities()
+        if prob_penalty < 1.0:
+            self.logger.debug(
+                "Probability normalization penalty applied",
+                yes_bid=f"{pm.yes_bid:.3f}",
+                no_bid=f"{pm.no_bid:.3f}",
+                sum=f"{pm.yes_bid + pm.no_bid:.3f}",
+                penalty=f"{prob_penalty:.2f}",
+            )
+            confidence *= prob_penalty
         
         # Apply escape clause penalty (if applicable)
         escape_clause_used = signal.signal_type.value == "escape_clause"

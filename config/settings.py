@@ -89,8 +89,11 @@ class SignalSettings(BaseSettings):
     
     # Divergence thresholds
     min_divergence_pct: float = 0.08  # 8% probability divergence required
-    min_pm_staleness_seconds: float = 0.0  # Disabled - PM updates fast, don't wait for staleness
-    max_pm_staleness_seconds: float = 600.0  # 10 minutes max (PM markets can be slow)
+    
+    # PM Staleness window (CRITICAL: Based on actual MM update frequency of 15-45s)
+    min_pm_staleness_seconds: float = 15.0  # MM doesn't update faster than this
+    optimal_pm_staleness_seconds: float = 25.0  # Peak opportunity window
+    max_pm_staleness_seconds: float = 60.0  # After 60s, opportunity likely passed
     
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves
