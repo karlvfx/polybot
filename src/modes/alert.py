@@ -155,11 +155,20 @@ class AlertMode(BaseMode):
         
         confidence = signal.scoring.confidence
         threshold = settings.alerts.alert_confidence_threshold
+        breakdown = signal.scoring.breakdown
         
-        # Check confidence threshold
-        if confidence < threshold:
+        # HIGH DIVERGENCE OVERRIDE: If divergence score is very high, bypass threshold
+        # This catches obvious opportunities that might have low scores on other factors
+        HIGH_DIV_OVERRIDE = 0.80  # 80% divergence score = definitely process
+        if breakdown and breakdown.divergence >= HIGH_DIV_OVERRIDE:
+            self.logger.info(
+                "🚀 HIGH DIVERGENCE OVERRIDE - Processing despite low confidence",
+                confidence=f"{confidence:.1%}",
+                divergence_score=f"{breakdown.divergence:.1%}",
+            )
+            # Skip confidence check, go straight to cooldown check
+        elif confidence < threshold:
             # Log rejection with breakdown
-            breakdown = signal.scoring.breakdown
             self.logger.info(
                 "📊 Signal below threshold",
                 confidence=f"{confidence:.1%}",
@@ -170,13 +179,13 @@ class AlertMode(BaseMode):
                 liquidity=f"{breakdown.liquidity:.1%}" if breakdown else "N/A",
             )
             return False
-        
-        # Signal meets threshold!
-        self.logger.info(
-            "✅ Signal meets threshold!",
-            confidence=f"{confidence:.1%}",
-            threshold=f"{threshold:.1%}",
-        )
+        else:
+            # Signal meets threshold!
+            self.logger.info(
+                "✅ Signal meets threshold!",
+                confidence=f"{confidence:.1%}",
+                threshold=f"{threshold:.1%}",
+            )
         
         # Check cooldown
         now_ms = int(time.time() * 1000)

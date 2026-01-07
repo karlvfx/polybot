@@ -100,7 +100,7 @@ class SignalSettings(BaseSettings):
     # ==========================================================================
     # Spot movement thresholds (supporting filter)
     # ==========================================================================
-    min_spot_move_pct: float = 0.0005  # 0.05% minimum (very low for testing)
+    min_spot_move_pct: float = 0.0  # Disabled - divergence is primary signal
     atr_multiplier: float = 1.5  # move_threshold = max(0.7%, 1.5 * ATR)
     
     # Escape clause thresholds (allows sub-threshold moves when strongly supported)
