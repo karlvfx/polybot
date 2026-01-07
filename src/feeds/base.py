@@ -290,16 +290,16 @@ class BaseFeed(ABC):
             if self.ws_url.startswith('wss://'):
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
             
-            # Fast connection timeout (5s) - don't block other feeds
+            # Connection timeout (10s) - balance between fast and reliable
             self._ws = await asyncio.wait_for(
                 websockets.connect(
                     self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=30,  # Less frequent pings
+                    ping_timeout=20,   # More time to respond
                     close_timeout=5,
                     ssl=ssl_context,
                 ),
-                timeout=5.0
+                timeout=10.0  # 10s for VPS connections
             )
             self.health.connected = True
             self.logger.info("Connected to WebSocket")
