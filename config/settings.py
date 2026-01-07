@@ -90,12 +90,12 @@ class SignalSettings(BaseSettings):
     # Divergence thresholds
     min_divergence_pct: float = 0.08  # 8% probability divergence required
     
-    # PM Staleness window (CORRECTED: Fresh data is GOOD!)
-    # We only reject if data is TOO OLD, never for being too fresh
-    min_pm_staleness_seconds: float = 0.0   # NO minimum! Fresh data = active MM = good
+    # PM Staleness window (CORRECTED: Stale PM + Divergence = OPPORTUNITY!)
+    # If PM prices haven't changed but spot moved, MM is lagging = trade!
+    min_pm_staleness_seconds: float = 0.0   # NO minimum! Fresh data = good
     optimal_pm_staleness_seconds: float = 0.0  # Fresh is best
-    max_pm_staleness_seconds: float = 60.0  # Reject if older than 60s (MM probably stale)
-    soft_stale_threshold_seconds: float = 45.0  # Start penalizing confidence after 45s
+    max_pm_staleness_seconds: float = 300.0  # 5 minutes - only reject if VERY stale
+    soft_stale_threshold_seconds: float = 120.0  # Start soft penalty after 2 min
     
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves

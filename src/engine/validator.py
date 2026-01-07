@@ -94,23 +94,38 @@ class Validator:
         self,
         signal: SignalCandidate,
     ) -> tuple[bool, Optional[RejectionReason]]:
-        """Verify momentum hasn't reversed in last 10 seconds."""
+        """
+        Verify signal direction is consistent.
+        
+        UPDATED: For divergence strategy, we check divergence magnitude
+        not spot movement. Divergence IS the signal!
+        """
         if not signal.consensus:
             return False, RejectionReason.CONSENSUS_FAILURE
         
-        # Check 10-second move direction matches 30-second direction
-        last_10s_move = signal.consensus.max_10s_move_pct
+        # DIVERGENCE STRATEGY: Check divergence not spot movement
+        # If there's significant divergence, that IS the signal
+        if signal.polymarket:
+            from src.engine.signal_detector import calculate_spot_implied_prob
+            
+            spot_implied = calculate_spot_implied_prob(
+                signal.consensus.move_30s_pct,
+                scale=settings.signals.spot_implied_scale,
+            )
+            pm_implied = signal.polymarket.yes_bid
+            divergence = abs(spot_implied - pm_implied)
+            
+            # If divergence is significant, pass the check
+            if divergence >= settings.signals.min_divergence_pct:
+                return True, None
+        
+        # Fallback: Legacy spot movement check
         overall_move = signal.consensus.move_30s_pct
+        if abs(overall_move) >= settings.signals.escape_clause_min_move * 0.5:
+            return True, None
         
-        # If the 10s spike was in opposite direction of overall move, reject
-        # Note: We only have magnitude, so this is a simplified check
-        # In production, track signed 10s moves
-        
-        # For now, ensure overall move is still substantial
-        if abs(overall_move) < settings.signals.escape_clause_min_move * 0.8:
-            return False, RejectionReason.DIRECTION_REVERSED
-        
-        return True, None
+        # Only reject if BOTH divergence AND movement are tiny
+        return False, RejectionReason.DIRECTION_REVERSED
     
     def _check_liquidity_reality(
         self,
@@ -220,20 +235,26 @@ class Validator:
         self,
         signal: SignalCandidate,
     ) -> tuple[bool, Optional[RejectionReason]]:
-        """Check market isn't already correcting."""
+        """
+        Check if there's room for profitable trade.
+        
+        UPDATED: Tight spread is GOOD for execution!
+        Only reject if spread is unrealistically tight (0.1%)
+        """
         if not signal.polymarket:
-            return False, RejectionReason.SPREAD_CONVERGING
+            return True, None  # No PM data = can't check, pass it
         
         pm = signal.polymarket
         
-        # If spread is very tight, odds already converging
-        if pm.spread < 0.02:  # 2%
+        # Only reject if spread is impossibly tight (likely stale data)
+        if pm.spread < 0.001:  # 0.1% - almost no spread
             self.logger.debug(
-                "Spread too tight - already converging",
+                "Spread impossibly tight (stale data?)",
                 spread=pm.spread,
             )
             return False, RejectionReason.SPREAD_CONVERGING
         
+        # Tight spreads (1-2%) are GOOD for execution - don't reject!
         return True, None
     
     def _check_historical_performance(
