@@ -259,10 +259,10 @@ class ConfidenceScorer:
         pm = signal.polymarket
         
         # ======================
-        # Primary Signals (60%)
+        # Primary Signals (55%)
         # ======================
         
-        # Divergence score (40%)
+        # Divergence score (35%)
         divergence_score = self._score_divergence(
             consensus.move_30s_pct,
             pm.yes_bid,
@@ -270,6 +270,16 @@ class ConfidenceScorer:
         
         # PM staleness score (20%)
         pm_staleness_score = self._score_pm_staleness(pm.orderbook_age_seconds)
+        
+        # Debug logging
+        self.logger.debug(
+            "Confidence calculation",
+            spot_move=f"{consensus.move_30s_pct:.4%}",
+            pm_yes=f"{pm.yes_bid:.2f}",
+            pm_age=f"{pm.orderbook_age_seconds:.0f}s",
+            div_score=f"{divergence_score:.2f}",
+            staleness_score=f"{pm_staleness_score:.2f}",
+        )
         
         # ======================
         # Supporting Factors (40%)

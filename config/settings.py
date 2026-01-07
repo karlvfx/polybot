@@ -205,7 +205,7 @@ class AlertSettings(BaseSettings):
     """Discord alerting settings."""
     
     discord_webhook_url: str = Field(default="", description="Discord webhook URL")
-    alert_confidence_threshold: float = 0.70
+    alert_confidence_threshold: float = 0.50  # Lowered from 0.70 - max possible is ~80%
     alert_cooldown_seconds: int = 30
 
 

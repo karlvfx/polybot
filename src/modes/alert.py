@@ -150,11 +150,33 @@ class AlertMode(BaseMode):
     def should_process(self, signal: SignalCandidate) -> bool:
         """Check if signal meets alert threshold."""
         if not signal.scoring:
+            self.logger.warning("Signal has no scoring data")
             return False
         
+        confidence = signal.scoring.confidence
+        threshold = settings.alerts.alert_confidence_threshold
+        
         # Check confidence threshold
-        if signal.scoring.confidence < settings.alerts.alert_confidence_threshold:
+        if confidence < threshold:
+            # Log rejection with breakdown
+            breakdown = signal.scoring.breakdown
+            self.logger.info(
+                "📊 Signal below threshold",
+                confidence=f"{confidence:.1%}",
+                threshold=f"{threshold:.1%}",
+                divergence=f"{breakdown.divergence:.1%}" if breakdown else "N/A",
+                pm_staleness=f"{breakdown.pm_staleness:.1%}" if breakdown else "N/A",
+                consensus=f"{breakdown.consensus_strength:.1%}" if breakdown else "N/A",
+                liquidity=f"{breakdown.liquidity:.1%}" if breakdown else "N/A",
+            )
             return False
+        
+        # Signal meets threshold!
+        self.logger.info(
+            "✅ Signal meets threshold!",
+            confidence=f"{confidence:.1%}",
+            threshold=f"{threshold:.1%}",
+        )
         
         # Check cooldown
         now_ms = int(time.time() * 1000)
