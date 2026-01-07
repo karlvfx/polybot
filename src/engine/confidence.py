@@ -105,29 +105,25 @@ class ConfidenceScorer:
         """
         Score PM orderbook staleness (0.0 - 1.0).
         
-        Stale orderbook = opportunity hasn't been arbed yet.
+        CORRECTED: Fresh data is GOOD! We only penalize STALE data.
         
-        Window: 15-45 seconds is optimal (based on actual MM behavior).
-        - Under 15s: Too fresh, MM hasn't had time to lag
-        - 15-25s: Optimal window (MM lagging, opportunity exists)
-        - 25-45s: Good, edge may be closing
-        - Over 60s: Opportunity likely passed
+        - 0-45s: Perfect (1.0) - Fresh data means active MM
+        - 45-60s: Soft penalty (1.0 → 0.5) - Getting stale
+        - Over 60s: Reject (0.0) - Data too old
         """
-        min_age = settings.signals.min_pm_staleness_seconds  # 15s
-        optimal_age = settings.signals.optimal_pm_staleness_seconds  # 25s
+        soft_stale = settings.signals.soft_stale_threshold_seconds  # 45s
         max_age = settings.signals.max_pm_staleness_seconds  # 60s
         
-        if orderbook_age_seconds < min_age:
-            # Too fresh - MM hasn't had time to lag
-            return 0.0
-        elif orderbook_age_seconds <= optimal_age:
-            # Ramping up to optimal (15s → 25s)
-            return (orderbook_age_seconds - min_age) / (optimal_age - min_age)
+        if orderbook_age_seconds <= soft_stale:
+            # Fresh to normal age - NO PENALTY (this is GOOD!)
+            return 1.0
         elif orderbook_age_seconds <= max_age:
-            # Ramping down from optimal
-            return 1.0 - (orderbook_age_seconds - optimal_age) / (max_age - optimal_age)
+            # Getting stale - linear penalty from 1.0 to 0.5
+            penalty_range = max_age - soft_stale
+            excess_age = orderbook_age_seconds - soft_stale
+            return 1.0 - (0.5 * excess_age / penalty_range)
         else:
-            # Too stale
+            # Too stale - reject
             return 0.0
     
     # ==========================================================================

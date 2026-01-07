@@ -136,10 +136,10 @@ class SignalDetector:
         pm_age = pm_data.orderbook_age_seconds
         
         # Check if actionable
+        # CORRECTED: Fresh data is GOOD! Only reject if TOO STALE
         is_actionable = (
             divergence >= settings.signals.min_divergence_pct and
-            pm_age >= settings.signals.min_pm_staleness_seconds and
-            pm_age <= settings.signals.max_pm_staleness_seconds
+            pm_age <= settings.signals.max_pm_staleness_seconds  # Only check max, not min!
         )
         
         return DivergenceData(
@@ -441,18 +441,8 @@ class SignalDetector:
                         required=f"{settings.signals.min_divergence_pct:.1%}",
                         direction=divergence_data.signal_direction,
                     )
-            elif divergence_data.pm_orderbook_age_seconds < settings.signals.min_pm_staleness_seconds:
-                self._track_rejection(
-                    "pm_too_fresh", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
-                    divergence_data.signal_direction, consensus, pm_data
-                )
-                self.logger.info(
-                    "⏸️ PM orderbook too fresh (not stale enough)",
-                    pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
-                    required=f"{settings.signals.min_pm_staleness_seconds:.1f}s",
-                    divergence=f"{divergence_data.divergence:.1%}",
-                )
             elif divergence_data.pm_orderbook_age_seconds > settings.signals.max_pm_staleness_seconds:
+                # CORRECTED: Only reject if TOO STALE (fresh data is GOOD!)
                 self._track_rejection(
                     "pm_too_stale", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
                     divergence_data.signal_direction, consensus, pm_data
