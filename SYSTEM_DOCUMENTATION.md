@@ -488,6 +488,35 @@ if divergence >= 0.08 and pm_age >= 8s and pm_age <= 30s:
    - Original: €50 at best price
    - Liquidity collapse detection still active
 
+#### High Divergence Override (v1.1)
+
+**NEW**: When divergence exceeds 30%, ALL supporting filters are bypassed:
+
+```python
+HIGH_DIV_OVERRIDE_THRESHOLD = 0.30  # 30%
+
+if divergence >= HIGH_DIV_OVERRIDE_THRESHOLD:
+    # Skip volume, spike, spot move, agreement checks
+    # Only check: liquidity collapse (safety)
+    return SIGNAL_APPROVED
+```
+
+**Why**: Night session analysis showed 40%+ divergences being rejected due to minor filters like "spot move too small". This override ensures massive opportunities aren't missed.
+
+#### Stale Data Filter (v1.1)
+
+**NEW**: Signals are skipped if PM data is older than 5 minutes:
+
+```python
+MAX_PM_DATA_AGE_SECONDS = 300  # 5 minutes
+
+if pm_data.orderbook_age_seconds > MAX_PM_DATA_AGE_SECONDS:
+    log_warning("PM data too stale")
+    return SKIP_SIGNAL_CHECK
+```
+
+**Why**: Night session showed decisions being made on 10-45 minute old data.
+
 #### Escape Clause
 
 Allows sub-threshold moves (0.8-1.0%) when strongly supported by other factors.
@@ -993,6 +1022,11 @@ polybot/
 
 ### Recent Changes (v1.1)
 
+**Critical Fixes (Latest):**
+- **HIGH DIVERGENCE OVERRIDE**: If divergence >30%, bypass all supporting filters
+- **STALE DATA FILTER**: Skip signals if PM data >5 minutes old
+- **ORACLE OPTIONAL**: Divergence strategy doesn't require oracle (spot-PM is primary signal)
+
 **Signal Detection Tuning:**
 - Volume surge filter: **DISABLED** (was always <1.0x due to calculation issue)
 - Spike concentration filter: **DISABLED** (was always 0%)
@@ -1010,6 +1044,7 @@ polybot/
 - Signal rejections now logged at INFO level (visible in normal logs)
 - Shows exactly which filter blocked each signal
 - 30-second rejection stats summary
+- High divergence override logged as 🚀
 
 **VPS Deployment:**
 - Complete VPS setup guide added (VPS_SETUP.md)
