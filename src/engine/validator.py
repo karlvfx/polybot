@@ -202,9 +202,19 @@ class Validator:
         self,
         signal: SignalCandidate,
     ) -> tuple[bool, Optional[RejectionReason]]:
-        """Check oracle isn't about to update."""
-        if not signal.oracle or not signal.consensus:
-            return False, RejectionReason.ORACLE_TOO_FRESH
+        """
+        Check oracle isn't about to update.
+        
+        NOTE: For divergence strategy, oracle is OPTIONAL.
+        We only check if oracle data is available.
+        """
+        # DIVERGENCE STRATEGY: Oracle is optional
+        # If no oracle data, skip this check (pass)
+        if not signal.oracle:
+            return True, None  # No oracle = can't check, pass it
+        
+        if not signal.consensus:
+            return True, None  # No consensus = can't determine regime, pass it
         
         oracle = signal.oracle
         regime = signal.consensus.volatility_regime
@@ -215,16 +225,16 @@ class Validator:
         else:
             min_age = settings.chainlink.oracle_min_age_normal_vol
         
-        # Check oracle not too fresh
+        # Check oracle not too fresh (only if we have oracle data)
         if oracle.oracle_age_seconds < min_age:
             return False, RejectionReason.ORACLE_TOO_FRESH
         
-        # Check oracle not too stale (update imminent)
-        if oracle.oracle_age_seconds > 70:  # Stricter than primary check
-            return False, RejectionReason.ORACLE_TOO_STALE
+        # For divergence strategy, stale oracle is actually GOOD
+        # (means PM hasn't adjusted yet) - so we REMOVE the stale check
+        # The max staleness is already checked in signal_detector
         
-        # Check for fast heartbeat mode
-        if oracle.is_fast_heartbeat_mode:
+        # Check for fast heartbeat mode (optional - can skip if oracle stale)
+        if oracle.oracle_age_seconds < 60 and oracle.is_fast_heartbeat_mode:
             recent_avg = sum(oracle.recent_heartbeat_intervals) / len(oracle.recent_heartbeat_intervals) if oracle.recent_heartbeat_intervals else 60
             if recent_avg < settings.chainlink.fast_heartbeat_threshold:
                 return False, RejectionReason.FAST_HEARTBEAT_MODE
@@ -239,22 +249,25 @@ class Validator:
         Check if there's room for profitable trade.
         
         UPDATED: Tight spread is GOOD for execution!
-        Only reject if spread is unrealistically tight (0.1%)
+        Only reject if PM data is completely missing (no orderbook).
         """
         if not signal.polymarket:
-            return True, None  # No PM data = can't check, pass it
+            return True, None  # No PM data object = can't check, pass it
         
         pm = signal.polymarket
         
-        # Only reject if spread is impossibly tight (likely stale data)
-        if pm.spread < 0.001:  # 0.1% - almost no spread
+        # Check if PM data is actually populated (has valid prices)
+        # If yes_bid AND no_bid are both 0, we have no orderbook data
+        if pm.yes_bid <= 0.0 and pm.no_bid <= 0.0:
             self.logger.debug(
-                "Spread impossibly tight (stale data?)",
-                spread=pm.spread,
+                "No PM orderbook data (bids are 0)",
+                yes_bid=pm.yes_bid,
+                no_bid=pm.no_bid,
             )
             return False, RejectionReason.SPREAD_CONVERGING
         
-        # Tight spreads (1-2%) are GOOD for execution - don't reject!
+        # Tight spreads (even 0.5%) are FINE for execution - don't reject!
+        # The old 1.5% threshold was causing 87% false exits
         return True, None
     
     def _check_historical_performance(

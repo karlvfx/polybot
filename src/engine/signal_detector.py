@@ -411,6 +411,15 @@ class SignalDetector:
         Returns:
             SignalCandidate if opportunity detected, None otherwise
         """
+        # EARLY CHECK: Reject if PM data is empty/invalid
+        # This prevents generating signals for assets without active markets
+        if pm_data.yes_bid <= 0.0 and pm_data.no_bid <= 0.0:
+            self.logger.debug(
+                "No PM orderbook data (both bids=0)",
+                market_id=pm_data.market_id[:20] if pm_data.market_id else "none",
+            )
+            return None
+        
         # Calculate divergence (core signal)
         divergence_data = self.calculate_divergence(consensus, pm_data)
         
