@@ -266,19 +266,9 @@ class VirtualTrader:
             )
             return None  # Return None instead of broken position
         
-        # SAFETY CHECK: Don't trade at VERY extreme prices (< 5% or > 95%)
-        # We have dynamic stop loss now, so we can trade wider range
-        # Only reject truly extreme edges where there's no room to profit
-        MIN_SAFE_PRICE = 0.05
-        MAX_SAFE_PRICE = 0.95
-        if entry_price < MIN_SAFE_PRICE or entry_price > MAX_SAFE_PRICE:
-            self.logger.warning(
-                "Entry price too extreme - skipping position",
-                side=side,
-                entry_price=f"${entry_price:.3f}",
-                safe_range=f"${MIN_SAFE_PRICE:.2f}-${MAX_SAFE_PRICE:.2f}",
-            )
-            return None
+        # NOTE: Extreme price filter removed - dynamic stop loss handles risk
+        # At $0.02, if divergence is 47%, that's a huge opportunity
+        # The dynamic stop loss (allows $0.03 move) provides protection
         
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None

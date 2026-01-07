@@ -420,21 +420,8 @@ class SignalDetector:
             )
             return None
         
-        # EARLY CHECK: Reject VERY extreme prices (outside 5%-95% range)
-        # We have dynamic stop loss now, so wider range is OK
-        # Only reject truly extreme edges (< 5% or > 95%)
-        MIN_TRADEABLE_PRICE = 0.05
-        MAX_TRADEABLE_PRICE = 0.95
-        
-        # Check if the side we'd trade is too extreme
-        # If both yes AND no are below 5% (impossible) or above 95% (impossible), skip
-        if pm_data.yes_bid < MIN_TRADEABLE_PRICE and pm_data.no_bid < MIN_TRADEABLE_PRICE:
-            self.logger.debug(
-                "Both sides at extreme low prices - skipping",
-                yes_bid=pm_data.yes_bid,
-                no_bid=pm_data.no_bid,
-            )
-            return None
+        # NOTE: Extreme price filter removed - dynamic stop loss handles risk
+        # High divergence at extreme prices (like 47% at $0.02) = big opportunity
         
         # Calculate divergence (core signal)
         divergence_data = self.calculate_divergence(consensus, pm_data)
