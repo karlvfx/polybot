@@ -639,9 +639,9 @@ class VirtualPosition:
 | Exit Type | Condition | Priority |
 |-----------|-----------|----------|
 | Oracle Update Imminent | Age > 65s | 1 (Highest) |
-| Spread Converged | Spread < 1.5% | 2 |
+| Spread Converged | Spread < 0.5% | 2 |
 | Take Profit | PnL ≥ 8% | 3 |
-| Stop Loss | PnL < -3% | 4 |
+| Stop Loss | $0.03 adverse move | 4 |
 | Time Limit | Duration > 90s | 5 |
 | Emergency | Duration > 120s | 6 |
 | Liquidity Collapse | Detected | 7 |
@@ -720,6 +720,18 @@ class AlertMode:
             on_update=self._on_virtual_position_update,
             on_closed=self._on_virtual_position_closed,
         )
+    
+    async def process_signal(self, signal, asset):
+        # IMPORTANT: Use signal.polymarket (correct asset's data)
+        # NOT self._polymarket_feed.get_data() (would use primary asset)
+        pm_data = signal.polymarket
+        if pm_data and pm_data.yes_ask > 0:
+            await self._virtual_trader.open_virtual_position(
+                signal=signal,
+                market_id=signal.market_id,
+                pm_data=pm_data,
+                asset=asset,
+            )
 ```
 
 ### Night Auto Mode (`modes/night_auto.py`)
@@ -815,10 +827,11 @@ class Settings(BaseSettings):
 
 ### Virtual Trading Safeguards
 
-- Stop loss at -3%
+- **Dynamic stop loss**: $0.03 adverse move (not fixed %, avoids instant stop-outs on low prices)
 - Time limit at 90 seconds
 - Emergency exit at 120 seconds
 - Liquidity collapse detection
+- Entry price validation (must be > $0.00 and < $1.00)
 
 ---
 
@@ -1123,9 +1136,12 @@ polybot/
 ### Recent Changes (v1.1)
 
 **Critical Fixes (Latest):**
+- **MULTI-ASSET VIRTUAL TRADING FIX**: Virtual trader now uses `signal.polymarket` (correct asset's data) instead of primary feed. Previously ETH/SOL signals failed because they tried to use BTC's PM feed.
 - **HIGH DIVERGENCE OVERRIDE**: If divergence >30%, bypass all supporting filters
 - **STALE DATA FILTER**: Skip signals if PM data >5 minutes old
 - **ORACLE OPTIONAL**: Divergence strategy doesn't require oracle (spot-PM is primary signal)
+- **DYNAMIC STOP LOSS**: Uses absolute price move ($0.03) instead of fixed percentage, preventing instant stop-outs on low-priced markets
+- **EXTREME PRICE FILTER REMOVED**: No longer blocks trades at extreme odds (e.g., YES at $0.04)
 
 **Signal Detection Tuning:**
 - Volume surge filter: **DISABLED** (was always <1.0x due to calculation issue)
