@@ -428,8 +428,24 @@ class SignalDetector:
             )
             return None
         
-        # NOTE: Extreme price filter removed - dynamic stop loss handles risk
-        # High divergence at extreme prices (like 47% at $0.02) = big opportunity
+        # EARLY CHECK: Reject if PM prices are invalid (0 = no orderbook data)
+        # A 50% divergence when PM shows 0% is FAKE - there's just no data!
+        if pm_data.yes_bid <= 0.001 and pm_data.no_bid <= 0.001:
+            self.logger.debug(
+                "PM orderbook empty (both prices ~0)",
+                yes_bid=pm_data.yes_bid,
+                no_bid=pm_data.no_bid,
+            )
+            return None
+        
+        # Also reject if either YES or NO is at 0 (should sum to ~1.0)
+        if pm_data.yes_bid <= 0.001 or pm_data.no_bid <= 0.001:
+            self.logger.debug(
+                "PM orderbook incomplete (one side is ~0)",
+                yes_bid=pm_data.yes_bid,
+                no_bid=pm_data.no_bid,
+            )
+            return None
         
         # Calculate divergence (core signal)
         divergence_data = self.calculate_divergence(consensus, pm_data)
