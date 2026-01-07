@@ -420,15 +420,17 @@ class SignalDetector:
             )
             return None
         
-        # EARLY CHECK: Reject extreme prices (outside 15%-85% range)
-        # At extreme odds, small price moves cause huge % losses
-        # E.g., at $0.04 (4%), a $0.01 move = -25% loss!
-        MIN_TRADEABLE_PRICE = 0.15  # Don't trade if YES < 15%
-        MAX_TRADEABLE_PRICE = 0.85  # Don't trade if YES > 85%
+        # EARLY CHECK: Reject VERY extreme prices (outside 5%-95% range)
+        # We have dynamic stop loss now, so wider range is OK
+        # Only reject truly extreme edges (< 5% or > 95%)
+        MIN_TRADEABLE_PRICE = 0.05
+        MAX_TRADEABLE_PRICE = 0.95
         
+        # Check if the side we'd trade is too extreme
+        # If both yes AND no are below 5% (impossible) or above 95% (impossible), skip
         if pm_data.yes_bid < MIN_TRADEABLE_PRICE and pm_data.no_bid < MIN_TRADEABLE_PRICE:
             self.logger.debug(
-                "Both sides at extreme prices - skipping",
+                "Both sides at extreme low prices - skipping",
                 yes_bid=pm_data.yes_bid,
                 no_bid=pm_data.no_bid,
             )

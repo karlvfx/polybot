@@ -266,10 +266,11 @@ class VirtualTrader:
             )
             return None  # Return None instead of broken position
         
-        # SAFETY CHECK: Don't trade at extreme prices (< 15% or > 85%)
-        # At these levels, small $0.01 moves cause huge % losses
-        MIN_SAFE_PRICE = 0.15
-        MAX_SAFE_PRICE = 0.85
+        # SAFETY CHECK: Don't trade at VERY extreme prices (< 5% or > 95%)
+        # We have dynamic stop loss now, so we can trade wider range
+        # Only reject truly extreme edges where there's no room to profit
+        MIN_SAFE_PRICE = 0.05
+        MAX_SAFE_PRICE = 0.95
         if entry_price < MIN_SAFE_PRICE or entry_price > MAX_SAFE_PRICE:
             self.logger.warning(
                 "Entry price too extreme - skipping position",
