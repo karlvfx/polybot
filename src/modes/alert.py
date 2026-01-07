@@ -230,19 +230,28 @@ class AlertMode(BaseMode):
             try:
                 pm_data = self._polymarket_feed.get_data()
                 if pm_data:
-                    await self._virtual_trader.open_virtual_position(
+                    position = await self._virtual_trader.open_virtual_position(
                         signal=signal,
                         market_id=signal.market_id,
                         pm_data=pm_data,
                         asset=asset,
                     )
-                    virtual_position_opened = True
-                    self.logger.info(
-                        "Virtual position opened",
-                        asset=asset,
-                        direction=signal.direction.value,
-                        confidence=f"{signal.scoring.confidence:.1%}" if signal.scoring else "N/A",
-                    )
+                    if position is not None:  # Handle invalid entry price case
+                        virtual_position_opened = True
+                        self.logger.info(
+                            "Virtual position opened",
+                            asset=asset,
+                            direction=signal.direction.value,
+                            entry_price=f"${position.entry_price:.3f}",
+                            confidence=f"{signal.scoring.confidence:.1%}" if signal.scoring else "N/A",
+                        )
+                    else:
+                        self.logger.warning(
+                            "Virtual position not opened - invalid entry price",
+                            asset=asset,
+                            yes_ask=pm_data.yes_ask,
+                            no_ask=pm_data.no_ask,
+                        )
                 else:
                     self.logger.warning("No Polymarket data available for virtual position")
             except Exception as e:

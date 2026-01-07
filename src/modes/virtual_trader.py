@@ -85,9 +85,11 @@ class VirtualPosition:
     
     @property
     def current_pnl_pct(self) -> float:
-        if not self.current_price or self.entry_price == 0:
+        if not self.current_price or self.entry_price <= 0:
             return 0.0
-        return (self.current_price - self.entry_price) / self.entry_price
+        # Clamp to reasonable bounds (-100% to +100%)
+        pnl = (self.current_price - self.entry_price) / self.entry_price
+        return max(-1.0, min(1.0, pnl))
     
     @property
     def current_pnl_eur(self) -> float:
@@ -143,18 +145,20 @@ class VirtualPerformance:
         self.total_pnl_eur += pnl
         
         # Win/loss tracking
-        if pnl > 0:
+        # Note: pnl == 0 is a "scratch" (neither win nor loss)
+        if pnl > 0.001:  # Small threshold to account for rounding
             self.winning_trades += 1
             if self.current_streak >= 0:
                 self.current_streak += 1
             else:
                 self.current_streak = 1
-        else:
+        elif pnl < -0.001:  # Only count as loss if actually negative
             self.losing_trades += 1
             if self.current_streak <= 0:
                 self.current_streak -= 1
             else:
                 self.current_streak = -1
+        # else: pnl ≈ 0 = scratch, don't update streak or win/loss counts
         
         # Update streaks
         self.best_streak = max(self.best_streak, self.current_streak)
@@ -241,7 +245,7 @@ class VirtualTrader:
         market_id: str,
         pm_data: PolymarketData,
         asset: str = "BTC",
-    ) -> VirtualPosition:
+    ) -> Optional[VirtualPosition]:
         """Simulate opening a position with fee calculation."""
         
         # Determine entry price and side based on direction
@@ -250,6 +254,17 @@ class VirtualTrader:
             entry_price = pm_data.yes_ask  # We buy YES at ask
         else:
             entry_price = pm_data.no_ask  # We buy NO at ask
+        
+        # SAFETY CHECK: Don't open position if entry price is invalid
+        if entry_price <= 0.0 or entry_price > 1.0:
+            self.logger.error(
+                "Invalid entry price - cannot open position",
+                side=side,
+                entry_price=entry_price,
+                yes_ask=pm_data.yes_ask,
+                no_ask=pm_data.no_ask,
+            )
+            return None  # Return None instead of broken position
         
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
@@ -346,10 +361,11 @@ class VirtualTrader:
                     continue
                 
                 # Update current price (what we could sell at)
+                # When SELLING tokens, we sell at the BID (not ask!)
                 if position.direction == "UP":
-                    current_price = pm_data.yes_ask  # We'd sell YES at ask
+                    current_price = pm_data.yes_bid  # We'd sell YES at BID
                 else:
-                    current_price = pm_data.no_ask
+                    current_price = pm_data.no_bid   # We'd sell NO at BID
                 
                 position.current_price = current_price
                 
@@ -404,7 +420,9 @@ class VirtualTrader:
             return "oracle_update_imminent"
         
         # EXIT 2: Spread converged (market corrected)
-        if pm_data.spread < 0.015:  # 1.5% spread means opportunity closed
+        # Note: Normal PM spreads are 1-5%, so 1.5% is NOT tight!
+        # Only exit if spread is very tight (< 0.5%) meaning no room for profit
+        if pm_data.spread < 0.005:  # 0.5% spread = very tight, opportunity gone
             return "spread_converged"
         
         # EXIT 3: Take profit
