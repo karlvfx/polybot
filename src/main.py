@@ -275,6 +275,17 @@ class TradingBot:
         if not pm_data:
             return
         
+        # STALE DATA FILTER: Skip if PM data is too old (>5 minutes)
+        MAX_PM_DATA_AGE_SECONDS = 300  # 5 minutes max
+        if pm_data.orderbook_age_seconds > MAX_PM_DATA_AGE_SECONDS:
+            self.logger.warning(
+                "⚠️ Skipping signal check - PM data too stale",
+                asset=asset,
+                pm_age=f"{pm_data.orderbook_age_seconds:.0f}s",
+                max_age=f"{MAX_PM_DATA_AGE_SECONDS}s",
+            )
+            return
+        
         # Periodic status log (every 30 seconds per asset)
         if not hasattr(self, '_last_status_log_ms_by_asset'):
             self._last_status_log_ms_by_asset = {}
@@ -292,9 +303,8 @@ class TradingBot:
                 pm_spread=f"{pm_data.spread:.3f}",
             )
         
-        # For assets without oracle, skip signal detection (oracle-lag strategy requires oracle)
-        if not oracle:
-            return
+        # NOTE: Oracle is optional for divergence strategy (spot-PM divergence is primary signal)
+        # We'll still pass it if available for logging/metrics
         
         # Detect signal
         signal = self.signal_detector.detect(consensus, oracle, pm_data)

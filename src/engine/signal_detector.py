@@ -192,7 +192,23 @@ class SignalDetector:
         
         These are softer filters that help avoid bad trades.
         Returns: (passed, rejection_reason)
+        
+        OVERRIDE: If divergence is extremely high (>30%), bypass most filters.
         """
+        # HIGH DIVERGENCE OVERRIDE: Skip most filters if divergence is massive
+        HIGH_DIV_OVERRIDE_THRESHOLD = 0.30  # 30% divergence = definitely trade
+        if divergence_data.divergence >= HIGH_DIV_OVERRIDE_THRESHOLD:
+            self.logger.info(
+                "🚀 HIGH DIVERGENCE OVERRIDE - Bypassing supporting filters",
+                divergence=f"{divergence_data.divergence:.1%}",
+                threshold=f"{HIGH_DIV_OVERRIDE_THRESHOLD:.0%}",
+            )
+            # Only check critical safety filters
+            if pm_data.liquidity_collapsing:
+                return False, RejectionReason.LIQUIDITY_COLLAPSING
+            # Skip other filters for high divergence
+            return True, None
+        
         # Volume surge - confirms move is real
         if consensus.volume_surge_ratio < settings.signals.volume_surge_threshold:
             self._track_rejection("volume_low")
