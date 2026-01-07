@@ -136,11 +136,19 @@ class SignalDetector:
         pm_age = pm_data.orderbook_age_seconds
         
         # Check if actionable
-        # CORRECTED: Fresh data is GOOD! Only reject if TOO STALE
-        is_actionable = (
-            divergence >= settings.signals.min_divergence_pct and
-            pm_age <= settings.signals.max_pm_staleness_seconds  # Only check max, not min!
-        )
+        # HIGH DIVERGENCE OVERRIDE: If divergence is huge (>30%), ignore staleness
+        # A 50% divergence with stale PM = MASSIVE opportunity, not a problem!
+        HIGH_DIV_OVERRIDE_PCT = 0.30  # 30% divergence bypasses staleness check
+        
+        if divergence >= HIGH_DIV_OVERRIDE_PCT:
+            # High divergence = always actionable (staleness doesn't matter)
+            is_actionable = True
+        else:
+            # Normal case: need divergence AND fresh-ish PM data
+            is_actionable = (
+                divergence >= settings.signals.min_divergence_pct and
+                pm_age <= settings.signals.max_pm_staleness_seconds
+            )
         
         return DivergenceData(
             spot_implied_prob=spot_implied,

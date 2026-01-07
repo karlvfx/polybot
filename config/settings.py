@@ -97,8 +97,9 @@ class SignalSettings(BaseSettings):
     optimal_pm_staleness_seconds: float = 0.0  # Fresh is best
     # Note: price_staleness ≠ data_staleness. Prices may not change during quiet periods.
     # Data freshness is checked separately in main.py (2 min max)
-    max_pm_staleness_seconds: float = 600.0  # 10 minutes - allow for quiet markets
-    soft_stale_threshold_seconds: float = 300.0  # Start soft penalty after 5 min
+    # High divergence (>30%) bypasses staleness check entirely
+    max_pm_staleness_seconds: float = 900.0  # 15 minutes - very generous for quiet markets
+    soft_stale_threshold_seconds: float = 600.0  # Start soft penalty after 10 min
     
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves
