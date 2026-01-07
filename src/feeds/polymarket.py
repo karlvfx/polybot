@@ -781,6 +781,7 @@ class PolymarketFeed:
         self._last_no_bid: float = 0.0
         self._last_no_ask: float = 0.0
         self._last_price_change_ms: int = 0  # When any price last changed
+        self._last_data_received_ms: int = 0  # When we last received ANY orderbook update
         
         # NEW: Fee tracking (Jan 2026 Polymarket fee update)
         self._yes_fee_rate_bps: int = 0
@@ -1108,7 +1109,11 @@ class PolymarketFeed:
             self._last_no_bid = no_bid
             self._last_no_ask = no_ask
         
+        # Track when we received data (for connection health check)
+        self._last_data_received_ms = now_ms
+        
         # Calculate orderbook age (seconds since last price change)
+        # This is for divergence strategy - stale prices = opportunity
         orderbook_age_seconds = (now_ms - self._last_price_change_ms) / 1000.0
         
         self._last_snapshot_ms = now_ms

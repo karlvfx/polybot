@@ -279,16 +279,24 @@ class TradingBot:
         if not pm_data:
             return
         
-        # STALE DATA FILTER: Skip if PM data is too old (>5 minutes)
-        MAX_PM_DATA_AGE_SECONDS = 300  # 5 minutes max
-        if pm_data.orderbook_age_seconds > MAX_PM_DATA_AGE_SECONDS:
+        # STALE DATA FILTER: Skip if we haven't received PM data recently
+        # Note: orderbook_age_seconds = time since PRICES changed (can be long during quiet periods)
+        # We check timestamp_ms to see when we last got ANY data
+        MAX_DATA_AGE_SECONDS = 120  # 2 minutes - if no data for 2 min, connection issue
+        now_ms = int(time.time() * 1000)
+        data_age_seconds = (now_ms - pm_data.timestamp_ms) / 1000.0
+        
+        if data_age_seconds > MAX_DATA_AGE_SECONDS:
             self.logger.warning(
-                "⚠️ Skipping signal check - PM data too stale",
+                "⚠️ Skipping signal check - No PM data received recently",
                 asset=asset,
-                pm_age=f"{pm_data.orderbook_age_seconds:.0f}s",
-                max_age=f"{MAX_PM_DATA_AGE_SECONDS}s",
+                data_age=f"{data_age_seconds:.0f}s",
+                max_age=f"{MAX_DATA_AGE_SECONDS}s",
+                price_age=f"{pm_data.orderbook_age_seconds:.0f}s",
             )
             return
+        
+        # Price staleness is now handled in signal_detector (max_pm_staleness_seconds)
         
         # Periodic status log (every 30 seconds per asset)
         if not hasattr(self, '_last_status_log_ms_by_asset'):

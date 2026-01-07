@@ -95,8 +95,10 @@ class SignalSettings(BaseSettings):
     # If PM prices haven't changed but spot moved, MM is lagging = trade!
     min_pm_staleness_seconds: float = 0.0   # NO minimum! Fresh data = good
     optimal_pm_staleness_seconds: float = 0.0  # Fresh is best
-    max_pm_staleness_seconds: float = 300.0  # 5 minutes - only reject if VERY stale
-    soft_stale_threshold_seconds: float = 120.0  # Start soft penalty after 2 min
+    # Note: price_staleness ≠ data_staleness. Prices may not change during quiet periods.
+    # Data freshness is checked separately in main.py (2 min max)
+    max_pm_staleness_seconds: float = 600.0  # 10 minutes - allow for quiet markets
+    soft_stale_threshold_seconds: float = 300.0  # Start soft penalty after 5 min
     
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves
