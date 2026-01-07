@@ -88,7 +88,8 @@ class SignalSettings(BaseSettings):
     # ==========================================================================
     
     # Divergence thresholds
-    min_divergence_pct: float = 0.08  # 8% probability divergence required
+    # LOWERED: 8% was too strict, missing 5-6% opportunities
+    min_divergence_pct: float = 0.05  # 5% probability divergence required
     
     # PM Staleness window (CORRECTED: Stale PM + Divergence = OPPORTUNITY!)
     # If PM prices haven't changed but spot moved, MM is lagging = trade!

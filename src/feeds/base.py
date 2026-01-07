@@ -33,11 +33,11 @@ class FeedHealth:
     
     @property
     def is_stale(self) -> bool:
-        """Check if feed data is stale (>30 seconds old)."""
+        """Check if feed data is stale (>60 seconds old)."""
         if self.last_message_ms == 0:
             return True
         age_ms = int(time.time() * 1000) - self.last_message_ms
-        return age_ms > 30000  # 30 seconds (increased from 10s for low-volume periods)
+        return age_ms > 60000  # 60 seconds (increased for low-volume/quiet periods)
     
     @property
     def age_ms(self) -> int:
