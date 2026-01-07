@@ -283,19 +283,23 @@ class BaseFeed(ABC):
                 pass
     
     async def _connect(self) -> bool:
-        """Establish WebSocket connection."""
+        """Establish WebSocket connection with fast timeout."""
         try:
             # Create SSL context with certifi certificates for wss:// connections
             ssl_context = None
             if self.ws_url.startswith('wss://'):
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
             
-            self._ws = await websockets.connect(
-                self.ws_url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5,
-                ssl=ssl_context,
+            # Fast connection timeout (5s) - don't block other feeds
+            self._ws = await asyncio.wait_for(
+                websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    ssl=ssl_context,
+                ),
+                timeout=5.0
             )
             self.health.connected = True
             self.logger.info("Connected to WebSocket")
@@ -308,6 +312,11 @@ class BaseFeed(ABC):
             
             await self._subscribe()
             return True
+        except asyncio.TimeoutError:
+            self.health.connected = False
+            self.health.error_count += 1
+            self.logger.warning("Connection timeout (5s)")
+            return False
         except Exception as e:
             self.health.connected = False
             self.health.error_count += 1
@@ -406,17 +415,17 @@ class BaseFeed(ABC):
                 await asyncio.sleep(1)
     
     async def start(self) -> None:
-        """Start the feed."""
+        """Start the feed (non-blocking initial connection)."""
         self._running = True
         self._tasks = []
         self.logger.info("Starting feed")
         
-        # Initial connection
-        if not await self._connect():
-            if self._running:
-                await self._reconnect()
+        # Try initial connection but DON'T block if it fails
+        # The receive loop will handle reconnection
+        # This allows all feeds to start simultaneously
+        asyncio.create_task(self._initial_connect())
         
-        # Start receive loop and heartbeat
+        # Start receive loop and heartbeat immediately
         self._tasks = [
             asyncio.create_task(self._receive_loop()),
             asyncio.create_task(self._heartbeat()),
@@ -426,6 +435,13 @@ class BaseFeed(ABC):
             await asyncio.gather(*self._tasks, return_exceptions=True)
         except asyncio.CancelledError:
             self.logger.info("Feed cancelled")
+    
+    async def _initial_connect(self) -> None:
+        """Attempt initial connection (non-blocking helper)."""
+        try:
+            await self._connect()
+        except Exception as e:
+            self.logger.warning("Initial connection failed, will retry", error=str(e))
     
     async def stop(self) -> None:
         """Stop the feed gracefully."""
