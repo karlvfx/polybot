@@ -12,6 +12,7 @@ from uuid import uuid4
 import structlog
 
 from src.models.schemas import SignalCandidate, PolymarketData, OracleData
+from src.utils.session_tracker import session_tracker
 
 logger = structlog.get_logger()
 
@@ -34,6 +35,9 @@ class VirtualPosition:
     spread_at_entry: float
     liquidity_at_entry: float
     confidence_at_entry: float
+    
+    # Asset (with default for backwards compatibility)
+    asset: str = "BTC"  # Asset being traded (BTC, ETH, SOL)
     
     # Entry context for rich alerts
     spot_price_at_entry: float = 0.0
@@ -236,6 +240,7 @@ class VirtualTrader:
         signal: SignalCandidate,
         market_id: str,
         pm_data: PolymarketData,
+        asset: str = "BTC",
     ) -> VirtualPosition:
         """Simulate opening a position with fee calculation."""
         
@@ -258,6 +263,11 @@ class VirtualTrader:
         entry_fee_pct = pm_data.calculate_effective_fee(side, entry_price, is_maker=is_maker_entry)
         entry_fee_eur = self.position_size_eur * entry_fee_pct
         
+        # Get divergence at entry if available
+        divergence_at_entry = 0.0
+        if signal.scoring and hasattr(signal.scoring.breakdown, 'divergence'):
+            divergence_at_entry = signal.scoring.breakdown.divergence
+        
         # Create virtual position
         position = VirtualPosition(
             position_id=f"virtual_{signal.signal_id[:8]}_{str(uuid4())[:4]}",
@@ -271,6 +281,7 @@ class VirtualTrader:
             spread_at_entry=pm_data.spread,
             liquidity_at_entry=pm_data.yes_liquidity_best,
             confidence_at_entry=signal.scoring.confidence if signal.scoring else 0,
+            asset=asset,  # Asset after required fields
             spot_price_at_entry=signal.consensus.consensus_price if signal.consensus else 0,
             oracle_price_at_entry=oracle.current_value if oracle else 0,
             volume_surge_at_entry=signal.consensus.volume_surge_ratio if signal.consensus else 0,
@@ -285,9 +296,20 @@ class VirtualTrader:
         
         self.open_positions.append(position)
         
+        # Record in session tracker
+        session_tracker.record_trade_opened(
+            position_id=position.position_id,
+            asset=asset,
+            direction=position.direction,
+            entry_price=entry_price,
+            confidence=position.confidence_at_entry,
+            divergence_at_entry=divergence_at_entry,
+        )
+        
         self.logger.info(
             "Virtual position opened",
             position_id=position.position_id,
+            asset=asset,
             direction=position.direction,
             entry_price=entry_price,
             entry_type="MAKER" if is_maker_entry else "TAKER",
@@ -479,9 +501,24 @@ class VirtualTrader:
         if position.position_id in self._monitor_tasks:
             del self._monitor_tasks[position.position_id]
         
+        # Record in session tracker
+        session_tracker.record_trade_closed(
+            position_id=position.position_id,
+            asset=position.asset,
+            direction=position.direction,
+            entry_price=position.entry_price,
+            exit_price=position.exit_price or 0,
+            exit_reason=exit_reason,
+            duration_seconds=position.duration_seconds,
+            gross_pnl_eur=position.gross_pnl_eur or 0,
+            total_fees_eur=position.total_fees_eur,
+            net_pnl_eur=position.net_pnl_eur or 0,
+        )
+        
         self.logger.info(
             "Virtual position closed",
             position_id=position.position_id,
+            asset=position.asset,
             exit_reason=exit_reason,
             gross_pnl=f"€{position.gross_pnl_eur:.2f}",
             total_fees=f"€{position.total_fees_eur:.3f}",

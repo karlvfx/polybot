@@ -31,6 +31,7 @@ from src.modes.night_auto import NightAutoMode
 from src.utils.logging import setup_logging, SignalLogger, MetricsLogger, PerformanceTracker
 from src.utils.alerts import DiscordAlerter
 from src.utils.time_filter import TimeOfDayAnalyzer
+from src.utils.session_tracker import session_tracker
 from src.models.schemas import ExchangeTick, SignalCandidate
 
 logger = structlog.get_logger()
@@ -254,6 +255,9 @@ class TradingBot:
     async def _check_signals_for_asset(self, asset: str) -> None:
         """Check for trading signals for a specific asset."""
         now_ms = int(time.time() * 1000)
+        
+        # Set current asset context for session tracking
+        self.signal_detector.set_asset(asset)
         
         # Get data for this asset
         if self.multi_asset and asset in self.multi_asset.asset_feeds:
@@ -814,16 +818,78 @@ class TradingBot:
         except Exception as e:
             print(f"Error generating time analysis report: {e}")
         
-        # Send shutdown notification
+        # Generate and print session summary
+        try:
+            session_summary = session_tracker.generate_summary()
+            print("\n" + "="*60)
+            print("SESSION SUMMARY")
+            print("="*60)
+            print(f"Duration: {session_summary['session']['duration_human']}")
+            print(f"Signals Detected: {session_summary['signals']['detected']}")
+            print(f"Signals Rejected: {session_summary['signals']['rejected']}")
+            
+            if session_summary['trades']['total'] > 0:
+                print(f"\nVirtual Trades: {session_summary['trades']['total']}")
+                print(f"  Win Rate: {session_summary['trades']['win_rate']*100:.1f}%")
+                print(f"  Gross P&L: €{session_summary['pnl']['gross']:.2f}")
+                print(f"  Fees Paid: €{session_summary['pnl']['fees']:.3f}")
+                print(f"  Net P&L: €{session_summary['pnl']['net']:.2f}")
+            
+            if session_summary['signals']['rejection_breakdown']:
+                print("\nTop Rejection Reasons:")
+                sorted_rejections = sorted(
+                    session_summary['signals']['rejection_breakdown'].items(),
+                    key=lambda x: x[1], reverse=True
+                )[:5]
+                for reason, count in sorted_rejections:
+                    print(f"  • {reason}: {count}")
+            
+            if session_summary['missed_opportunities']['count'] > 0:
+                print(f"\nMissed High-Divergence Opportunities: {session_summary['missed_opportunities']['count']}")
+                print(f"  Max Divergence Seen: {session_summary['missed_opportunities']['max_divergence_seen']:.1%}")
+            
+            print("\nConnection Health:")
+            for feed, stats in session_summary['connections'].items():
+                print(f"  • {feed}: {stats['uptime_pct']:.1f}% uptime, {stats['reconnects']} reconnects")
+            
+            if session_summary['trade_details']:
+                print("\nTrade Details:")
+                for trade in session_summary['trade_details'][-10:]:
+                    print(f"  {trade['result']} {trade['asset']} {trade['direction']}: "
+                          f"{trade['entry']}→{trade['exit']} | {trade['duration']} | "
+                          f"Net: {trade['net']} ({trade['exit_reason']})")
+            
+            print("="*60 + "\n")
+        except Exception as e:
+            print(f"Error generating session summary: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Send detailed session report to Discord
         if self.alerter:
             try:
-                summary = self.performance.get_summary()
-                await self.alerter.send_message(
-                    f"🛑 **Bot Stopped**\n"
-                    f"Signals: {summary['signals']['total']}\n"
-                    f"Trades: {summary['trades']['total']}\n"
-                    f"Net Profit: €{summary['profit']['net']:.2f}"
-                )
+                # Send compact summary first
+                compact_report = session_tracker.generate_compact_discord_report()
+                await self.alerter.send_message(f"🛑 **Bot Stopped**\n\n{compact_report}")
+                
+                # Send detailed report if trades occurred
+                if session_summary['trades']['total'] > 0:
+                    detailed_report = session_tracker.generate_discord_report()
+                    # Split if too long (Discord has 2000 char limit)
+                    if len(detailed_report) > 1900:
+                        # Send in chunks
+                        lines = detailed_report.split("\n")
+                        chunk = ""
+                        for line in lines:
+                            if len(chunk) + len(line) + 1 > 1900:
+                                await self.alerter.send_message(chunk)
+                                chunk = line
+                            else:
+                                chunk += "\n" + line if chunk else line
+                        if chunk:
+                            await self.alerter.send_message(chunk)
+                    else:
+                        await self.alerter.send_message(detailed_report)
             except Exception as e:
                 self.logger.error("Error sending shutdown notification", error=str(e))
         

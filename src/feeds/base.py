@@ -16,6 +16,8 @@ import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from src.utils.session_tracker import session_tracker
+
 logger = structlog.get_logger()
 
 
@@ -297,6 +299,13 @@ class BaseFeed(ABC):
             )
             self.health.connected = True
             self.logger.info("Connected to WebSocket")
+            
+            # Record connection event for session tracking
+            session_tracker.record_connection_event(
+                feed_name=self.name,
+                event_type="connected" if self.health.reconnect_count == 0 else "reconnected",
+            )
+            
             await self._subscribe()
             return True
         except Exception as e:
@@ -307,10 +316,23 @@ class BaseFeed(ABC):
     
     async def _reconnect(self) -> None:
         """Handle reconnection with exponential backoff."""
+        # Record disconnection event
+        session_tracker.record_connection_event(
+            feed_name=self.name,
+            event_type="disconnected",
+        )
+        
         delay = self.reconnect_delay
         while self._running:
             self.health.reconnect_count += 1
             self.logger.info("Reconnecting", attempt=self.health.reconnect_count, delay=delay)
+            
+            # Record reconnecting event
+            session_tracker.record_connection_event(
+                feed_name=self.name,
+                event_type="reconnecting",
+                attempt=self.health.reconnect_count,
+            )
             
             if await self._connect():
                 return

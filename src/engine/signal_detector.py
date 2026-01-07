@@ -29,6 +29,7 @@ from src.models.schemas import (
     RejectionReason,
 )
 from config.settings import settings
+from src.utils.session_tracker import session_tracker
 
 logger = structlog.get_logger()
 
@@ -83,6 +84,13 @@ class SignalDetector:
         self._rejection_counts: dict[str, int] = {}
         self._last_rejection_log_ms: int = 0
         self._rejection_log_interval_ms = 30_000  # Log rejection stats every 30s
+        
+        # Current asset context (for session tracking)
+        self._current_asset: str = "BTC"
+    
+    def set_asset(self, asset: str) -> None:
+        """Set the current asset being analyzed (for session tracking)."""
+        self._current_asset = asset
     
     # ==========================================================================
     # CORE: Divergence Calculation
@@ -166,9 +174,30 @@ class SignalDetector:
         
         return False
     
-    def _track_rejection(self, reason: str) -> None:
-        """Track rejection reason for periodic logging."""
+    def _track_rejection(
+        self,
+        reason: str,
+        divergence_pct: float = 0.0,
+        pm_staleness_seconds: float = 0.0,
+        direction: Optional[str] = None,
+        consensus: Optional[ConsensusData] = None,
+        pm_data: Optional[PolymarketData] = None,
+    ) -> None:
+        """Track rejection reason for periodic logging and session tracking."""
         self._rejection_counts[reason] = self._rejection_counts.get(reason, 0) + 1
+        
+        # Record in session tracker (for significant rejections with divergence)
+        if divergence_pct >= 0.05:  # 5%+ divergence worth tracking
+            asset = getattr(self, '_current_asset', 'BTC')
+            session_tracker.record_signal_rejected(
+                asset=asset,
+                rejection_reason=reason,
+                divergence_pct=divergence_pct,
+                pm_staleness_seconds=pm_staleness_seconds,
+                direction=direction,
+                spot_price=consensus.consensus_price if consensus else 0.0,
+                pm_yes_price=pm_data.yes_bid if pm_data else 0.0,
+            )
         
         # Periodically log rejection stats
         now_ms = int(time.time() * 1000)
@@ -211,7 +240,10 @@ class SignalDetector:
         
         # Volume surge - confirms move is real
         if consensus.volume_surge_ratio < settings.signals.volume_surge_threshold:
-            self._track_rejection("volume_low")
+            self._track_rejection(
+                "volume_low", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Volume surge insufficient",
                 volume_surge=f"{consensus.volume_surge_ratio:.2f}x",
@@ -222,7 +254,10 @@ class SignalDetector:
         
         # Spike concentration - rejects smooth drift
         if consensus.spike_concentration < settings.signals.spike_concentration_threshold:
-            self._track_rejection("smooth_drift")
+            self._track_rejection(
+                "smooth_drift", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Smooth drift (not a spike)",
                 spike_concentration=f"{consensus.spike_concentration:.1%}",
@@ -233,12 +268,18 @@ class SignalDetector:
         
         # Exchange agreement
         if not consensus.agreement:
-            self._track_rejection("no_consensus")
+            self._track_rejection(
+                "no_consensus", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info("❌ Rejected: No exchange consensus")
             return False, RejectionReason.CONSENSUS_FAILURE
         
         if consensus.agreement_score < settings.signals.min_agreement_score:
-            self._track_rejection("poor_agreement")
+            self._track_rejection(
+                "poor_agreement", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Poor exchange agreement",
                 agreement_score=f"{consensus.agreement_score:.1%}",
@@ -248,7 +289,10 @@ class SignalDetector:
         
         # Volatility check
         if consensus.volatility_30s > settings.signals.max_volatility_30s:
-            self._track_rejection("volatility_high")
+            self._track_rejection(
+                "volatility_high", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Volatility too high",
                 volatility=f"{consensus.volatility_30s:.3%}",
@@ -258,7 +302,10 @@ class SignalDetector:
         
         # Liquidity check
         if pm_data.yes_liquidity_best < settings.signals.min_liquidity_eur:
-            self._track_rejection("liquidity_low")
+            self._track_rejection(
+                "liquidity_low", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: PM liquidity too low",
                 liquidity=f"€{pm_data.yes_liquidity_best:.2f}",
@@ -267,13 +314,19 @@ class SignalDetector:
             return False, RejectionReason.LIQUIDITY_LOW
         
         if pm_data.liquidity_collapsing:
-            self._track_rejection("liquidity_collapsing")
+            self._track_rejection(
+                "liquidity_collapsing", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info("❌ Rejected: Liquidity collapsing")
             return False, RejectionReason.LIQUIDITY_COLLAPSING
         
         # Minimum spot move (prevents noise signals)
         if abs(consensus.move_30s_pct) < settings.signals.min_spot_move_pct:
-            self._track_rejection("insufficient_move")
+            self._track_rejection(
+                "insufficient_move", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, consensus, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Spot move too small",
                 spot_move=f"{consensus.move_30s_pct:.2%}",
@@ -321,7 +374,10 @@ class SignalDetector:
         viable = expected_edge >= required_edge
         
         if not viable:
-            self._track_rejection("fee_unfavorable")
+            self._track_rejection(
+                "fee_unfavorable", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                divergence_data.signal_direction, None, pm_data
+            )
             self.logger.info(
                 "❌ Rejected: Fee structure unfavorable",
                 expected_edge=f"{expected_edge:.2%}",
@@ -373,7 +429,10 @@ class SignalDetector:
         if not divergence_data.is_actionable:
             # Log why not actionable (INFO level to help debug)
             if divergence_data.divergence < settings.signals.min_divergence_pct:
-                self._track_rejection("divergence_low")
+                self._track_rejection(
+                    "divergence_low", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                    divergence_data.signal_direction, consensus, pm_data
+                )
                 # Only log if divergence is significant but below threshold
                 if divergence_data.divergence > 0.03:  # 3%+ worth logging
                     self.logger.info(
@@ -383,7 +442,10 @@ class SignalDetector:
                         direction=divergence_data.signal_direction,
                     )
             elif divergence_data.pm_orderbook_age_seconds < settings.signals.min_pm_staleness_seconds:
-                self._track_rejection("pm_too_fresh")
+                self._track_rejection(
+                    "pm_too_fresh", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                    divergence_data.signal_direction, consensus, pm_data
+                )
                 self.logger.info(
                     "⏸️ PM orderbook too fresh (not stale enough)",
                     pm_age=f"{divergence_data.pm_orderbook_age_seconds:.1f}s",
@@ -391,7 +453,10 @@ class SignalDetector:
                     divergence=f"{divergence_data.divergence:.1%}",
                 )
             elif divergence_data.pm_orderbook_age_seconds > settings.signals.max_pm_staleness_seconds:
-                self._track_rejection("pm_too_stale")
+                self._track_rejection(
+                    "pm_too_stale", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
+                    divergence_data.signal_direction, consensus, pm_data
+                )
                 self.logger.info(
                     "⏸️ PM too stale (opportunity may have passed)",
                     pm_age=f"{divergence_data.pm_orderbook_age_seconds:.0f}s",
@@ -436,6 +501,18 @@ class SignalDetector:
         
         # Record signal
         self._recent_signals.append((now_ms, direction.value))
+        
+        # Record detected signal in session tracker
+        asset = getattr(self, '_current_asset', 'BTC')  # Get asset from context
+        session_tracker.record_signal_detected(
+            asset=asset,
+            direction=direction.value,
+            divergence_pct=divergence_data.divergence,
+            pm_staleness_seconds=divergence_data.pm_orderbook_age_seconds,
+            confidence=0.0,  # Will be filled in by confidence scorer
+            spot_price=consensus.consensus_price,
+            pm_yes_price=pm_data.yes_bid,
+        )
         
         self.logger.info(
             "🎯 SIGNAL DETECTED (Divergence Strategy)",
