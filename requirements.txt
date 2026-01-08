@@ -11,6 +11,9 @@ uvloop>=0.19.0  # 2-4x faster asyncio event loop
 web3>=6.15.0
 eth-account>=0.10.0
 
+# Polymarket Trading
+py-clob-client>=0.17.0  # Official Polymarket SDK for maker orders
+
 # Data Processing
 pandas>=2.1.0
 numpy>=1.26.0

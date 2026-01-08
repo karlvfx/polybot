@@ -183,6 +183,10 @@ class PolymarketData:
     no_ask: float
     no_liquidity_best: float
     
+    # Token IDs for order execution (required for maker orders)
+    yes_token_id: str = ""
+    no_token_id: str = ""
+    
     # Fields with defaults (must come after non-default fields)
     yes_depth_3: list[OrderbookLevel] = field(default_factory=list)
     no_depth_3: list[OrderbookLevel] = field(default_factory=list)
