@@ -3,7 +3,7 @@
 
 **Goal**: Fix zero signals, eliminate connection instability, and maximize profitability using the cheapest, highest-impact solutions.
 
-**Last Updated**: January 8, 2026
+**Last Updated**: January 8, 2026 (Evening)
 
 ---
 
@@ -30,6 +30,10 @@
 | Z-Score Volume Surge | Extra | Statistical volume detection | Replaces broken filter |
 | Orderbook Freeze Detection | Extra | Detects MM repositioning | Better timing |
 | Dynamic Stop Loss | Extra | €0.03 absolute move vs % | Works at all prices |
+| **Maker-Only Orders** | 4.1 | `src/trading/maker_orders.py` | **0% fees + rebates** |
+| **Real Trader** | 4.1 | `src/trading/real_trader.py` | Production trading |
+| **BTC Disabled** | Extra | 15% threshold (effectively off) | Stops €300+ losses |
+| **Asset Optimization v2.2** | Extra | ETH 6.5%, SOL 8%, BTC 15% | Proven profitable |
 
 ### 🚧 IN PROGRESS / PARTIALLY DONE
 
@@ -38,197 +42,162 @@
 | uvloop | 5.1 | ⚠️ Disabled | Caused crashes on VPS, commented out |
 | Dual-Region Mesh | 2.1 | ❌ Not started | Needs AWS/Vultr setup |
 | Connection Stability | 2.x | 🔄 Ongoing | Binance blocked in US, using Coinbase+Kraken |
+| Maker Fill Rate Testing | 4.1 | 🔄 Running overnight | Need >40% fill rate |
 
 ### ❌ NOT STARTED
 
 | Item | Phase | Priority | Notes |
 |------|-------|----------|-------|
-| Pyth Network Feed | 3.1 | Medium | Free, adds redundancy |
-| Maker-Only Strategy | 4.1 | 🔥 HIGH | Doubles profit (requires py-clob-client) |
-| Dual-Sided Liquidity Trap | 4.2 | Medium | +30% fill rate |
+| Pyth Network Feed | 3.1 | Low | Free, adds redundancy |
+| Dual-Sided Liquidity Trap | 4.2 | Low | +30% fill rate |
 | BBR Congestion Control | 5.3 | Low | VPS kernel setting |
 | Batch REST Calls | 5.6 | Low | Minor optimization |
 | Latency Tracking | 5.8 | Medium | Better debugging |
 
 ---
 
-## 🚨 CRITICAL ISSUES (ORIGINAL)
+## 🎯 PRODUCTION CONFIG (v2.2)
 
-All three analyses agreed on your core problems:
-1. ~~**Broken confidence scoring**~~ ✅ FIXED - Adjusted staleness windows
-2. ~~**Connection instability**~~ 🔄 IMPROVED - Geo-block handling, better timeouts
-3. **Fee structure** - ❌ Still paying taker fees (1.6-3%)
-4. ~~**Signal detection**~~ ✅ FIXED - Signals now detected and trades opening
+### Asset Status
+
+| Asset | Status | Divergence | Liquidity | TP | SL | Time Limit |
+|-------|--------|------------|-----------|----|----|------------|
+| **BTC** | ❌ DISABLED | 15% | €40 | 6% | €0.035 | 60s |
+| **ETH** | ✅ Active | 6.5% | €15 | 6% | €0.03 | 90s |
+| **SOL** | ✅ Active | 8% | €15 | 9% | €0.03 | 120s |
+
+### Why BTC is Disabled
+
+From testing (217 trades, 4.5 hours):
+- **BTC**: 117 losses = **€-317** (83 stop losses, 34 liquidity collapses)
+- **SOL**: Profit engine (€20+ wins consistently)
+- **ETH**: Working well when liquidity available
+
+BTC MMs reprice in 4-8s - too fast for our 8-12s signal window.
+
+---
+
+## ✅ PHASE 4: MAKER-ONLY STRATEGY (IMPLEMENTED)
+
+### Files Created
+
+```
+src/trading/
+├── __init__.py
+├── maker_orders.py    # MakerOrderExecutor - core order execution
+└── real_trader.py     # RealTrader - position management
+```
+
+### How It Works
+
+```python
+from src.trading import MakerOrderExecutor
+
+executor = MakerOrderExecutor(private_key=PRIVATE_KEY)
+await executor.initialize()
+
+result = await executor.place_maker_order(
+    token_id=token_id,
+    side="BUY",
+    size=100,
+    target_price=0.52,
+    best_bid=0.50,
+    best_ask=0.54,
+)
+
+if result.success:
+    print(f"Filled at {result.fill_price}, rebate: €{result.rebate_earned}")
+else:
+    print("Not filled - skipping trade (no taker fallback)")
+```
+
+### Key Features
+
+1. **post_only=True** - Prevents accidental taker fills
+2. **3.5s timeout** - Edge decays quickly, don't wait
+3. **NO taker fallback** - Missed trade > paying 3% fee
+4. **Rebate tracking** - ~0.5% daily rebate on maker volume
+
+### Fee Impact
+
+| Order Type | Fee | Impact on €20 Trade |
+|------------|-----|---------------------|
+| Taker (before) | 1.6-3% | €0.32-0.60 fee |
+| **Maker (now)** | 0% + rebate | €0.00 fee + ~€0.01 rebate |
 
 ---
 
 ## 📋 REMAINING PHASES
 
-### **PHASE 4: FEE OPTIMIZATION** 🔥 PRIORITY NEXT
-*This is where the biggest profit gains are hiding*
-
-#### 4.1 Maker-Only Strategy 🔥🔥🔥
-**Time**: 3 hours | **Cost**: $0 | **Impact**: Fees 1.6% → 0.2%, profit per trade doubles
-
-**Requires**: `py-clob-client` (Polymarket SDK)
-
-```python
-from py_clob_client.client import ClobClient
-
-async def maker_rebate_arbitrage(token_id, target_price):
-    """
-    Instead of taking immediately, become the market maker
-    Collect 0.5-2% rebates instead of paying 1.6% fees
-    """
-    client = ClobClient(host="https://clob.polymarket.com", key=PRIVATE_KEY)
-    
-    # Place maker order INSIDE spread at attractive price
-    maker_price = target_price - 0.02  # 2% better than target
-    
-    order = client.create_and_post_order(
-        OrderArgs(
-            token_id=token_id,
-            price=maker_price,
-            size=100,
-            side=BUY,
-        ),
-        OrderType.GTC,  # Good-til-cancelled
-    )
-    
-    # Wait 15 seconds for fill
-    await asyncio.sleep(15)
-    
-    status = client.get_order(order['orderID'])
-    
-    if status['status'] != 'MATCHED':
-        # Not filled, cancel and take as last resort
-        client.cancel(order['orderID'])
-        return await take_with_ioc(token_id, target_price)
-    
-    return status
-```
-
-**Expected Impact**:
-- Effective fee: 1.6-3% → 0.2-0.5%
-- Profit per €20 trade: €0.30 → €1.50+
-- **5x profit improvement**
-
----
-
-#### 4.2 Hybrid IOC Fallback
-**Time**: 1 hour | **Cost**: $0 | **Impact**: Better fill rate
-
-```python
-async def hybrid_order(token_id, price, size, timeout=15):
-    """
-    Try maker first, fall back to IOC if not filled
-    """
-    # 1. Try as maker (collect rebates)
-    maker_order = await place_maker_order(token_id, price * 0.98, size)
-    
-    # 2. Wait for fill
-    for _ in range(timeout):
-        status = await check_order(maker_order)
-        if status['filled']:
-            logger.info("✅ Filled as MAKER - collected rebate!")
-            return status
-        await asyncio.sleep(1)
-    
-    # 3. Not filled - cancel and take
-    await cancel_order(maker_order)
-    logger.info("⚠️ Taking as IOC (paying taker fee)")
-    return await place_ioc_order(token_id, price, size)
-```
-
----
-
 ### **PHASE 2 REMAINING: Dual-Region Mesh**
-**Priority**: Medium (after fee optimization)
+**Priority**: Low (connection is stable now)
 
 ```
 Main Bot (Hetzner US) ← UDP ← [Watcher 1: EU Frankfurt ($5/mo)]
                        ← UDP ← [Watcher 2: Asia Singapore ($5/mo)]
 ```
 
-Benefits:
-- 99.9% data uptime
-- Fastest price from any region
-- Redundancy if one region fails
-
-Cost: $10/month for 2 lightweight watcher nodes
-
----
+Only needed if connection issues return.
 
 ### **PHASE 3 REMAINING: Pyth Network**
 **Priority**: Low (nice to have)
 
-```python
-PYTH_PRICE_IDS = {
-    "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-    "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
-    "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
-}
-
-async def pyth_price_stream():
-    uri = "wss://hermes.pyth.network/ws"
-    async with websockets.connect(uri) as ws:
-        await ws.send(json.dumps({
-            "type": "subscribe",
-            "ids": list(PYTH_PRICE_IDS.values())
-        }))
-        async for msg in ws:
-            data = json.loads(msg)
-            if "price_feed" in data:
-                yield parse_price(data)
-```
+Adds redundancy for price feeds. Not critical since we have Coinbase + Kraken.
 
 ---
 
-## 💰 UPDATED COST BREAKDOWN
+## 💰 COST BREAKDOWN
 
 ### Current Monthly Costs:
 - Hetzner US VPS: ~$5/mo
-- Hetzner EU VPS: ~$5/mo (can cancel now that US is primary)
 - **Total: ~$5/month**
 
-### If Adding Dual-Region Mesh:
-- AWS/Vultr watchers: +$10/mo
-- **Total: ~$15/month**
+### Profit Potential (Based on Testing):
+- €456 in 4.5 hours (virtual trading)
+- Extrapolated: €2,000-3,000/month potential
+- Actual will be lower due to fill rates
 
 ---
 
-## 📊 EXPECTED RESULTS
+## 📊 TESTING RESULTS
 
-### Current State (After Phase 1 Fixes):
-- ✅ Signals detected: 40-80/day
-- ✅ Trades executing: Yes (virtual mode)
-- ⚠️ Win rate: ~40-50% (needs tuning)
-- ❌ Fees: Still paying 1.6-3% taker
+### Session 1 (1:20:35)
+- Trades: 64 (31W/33L) = 48% WR
+- P&L: **€200.26**
+- BTC: 32 losses = €-68
+- SOL: Crushing it (€20 wins)
 
-### After Phase 4 (Fee Optimization):
-- Win rate: 50-60%
-- Effective fees: 0.2-0.5%
-- Profit per trade: €0.30 → €1.50+ (5x improvement)
-- **Break-even threshold drops significantly**
+### Session 2 (4:34:31)
+- Trades: 217 (89W/128L) = 41% WR
+- P&L: **€456.55**
+- BTC: 117 losses = €-317
+- SOL/ETH: Profitable
+
+### Key Insight
+**Profitable despite <50% win rate** because:
+- Winners are bigger (€20 max on SOL)
+- Losers are capped (€3-5 typical)
+- Edge is real, just need to avoid BTC
 
 ---
 
-## 🚀 RECOMMENDED NEXT STEPS
+## 🚀 NEXT STEPS
 
-### Immediate (Today):
-1. ✅ Pull latest changes on VPS: `git pull && sudo systemctl restart polybot`
-2. ✅ Add ETH, SOL to ASSETS: `ASSETS=BTC,ETH,SOL`
-3. 📊 Monitor for 24 hours with new per-asset configs
+### Tonight (Overnight Test)
+- [x] Deploy v2.2 config (BTC disabled, maker orders ready)
+- [ ] Monitor fill rates on maker orders
+- [ ] Collect ETH/SOL performance data
 
-### This Week:
-1. 🔥 Implement py-clob-client for maker orders
-2. 🔥 Test maker strategy in shadow mode
-3. 📊 Compare taker vs maker fills
+### Tomorrow (Real Trading)
+- [ ] Review overnight results
+- [ ] If fill rate >40%: Enable real trading
+- [ ] Start with €10-20 positions
+- [ ] Monitor first hour closely
 
-### Next Week:
-1. Deploy maker-only strategy to production
-2. Consider dual-region mesh if connection issues persist
-3. Add Pyth Network for redundancy
+### This Week
+- [ ] Collect 3+ days of real trading data
+- [ ] Optimize based on actual fill rates
+- [ ] Consider re-enabling BTC with US VPS + higher threshold
 
 ---
 
@@ -236,18 +205,29 @@ async def pyth_price_stream():
 
 1. **Binance Geo-Blocked in US**: Bot uses Coinbase + Kraken (2 exchanges is enough)
 2. **uvloop Crashes**: Disabled, using standard asyncio
-3. **Liquidity at Extreme Prices**: Per-asset config now blocks trades at $0.05-$0.10
+3. **BTC Unprofitable**: Disabled until latency/strategy improved
+4. **SOL Stop Loss Gaps**: Rare but can cause €18 losses (market gaps)
 
 ---
 
 ## 📝 CHANGELOG
 
-### January 8, 2026
+### January 8, 2026 (Evening) - v2.2
+- ✅ **MAKER-ONLY ORDERS IMPLEMENTED**
+  - `src/trading/maker_orders.py` - MakerOrderExecutor
+  - `src/trading/real_trader.py` - RealTrader for live trading
+  - Added `py-clob-client` to requirements
+  - 0% fees + daily rebates
+- ✅ **BTC DISABLED** - Raised threshold to 15%
+- ✅ **ETH LIQUIDITY LOWERED** - €30 → €15 (catch 24-29% divergences)
+- ✅ **SOL LIQUIDITY LOWERED** - €30 → €15
+- ✅ Updated ASSET_OPTIMIZATION.md with final config
+
+### January 8, 2026 (Morning)
 - ✅ Added per-asset configuration (BTC/ETH/SOL different thresholds)
-- ✅ Fixed liquidity collapse detection (50% drop + €25 floor)
-- ✅ Added Binance geo-block detection (HTTP 451 handling)
-- ✅ Added `high_divergence_override_pct` setting
-- 📄 Updated this document with current status
+- ✅ Asset-specific execution parameters (TP, SL, time limits)
+- ✅ Volatility scaling for ETH
+- ✅ Fixed liquidity collapse detection
 
 ### January 7, 2026
 - ✅ Implemented Z-score volume surge detection
@@ -260,6 +240,25 @@ async def pyth_price_stream():
 - ✅ Connection pool implementation
 - ✅ Binance futures feed
 - ✅ Funding rate acceleration signal
+
+---
+
+## 🎯 SUCCESS METRICS
+
+### Before Optimization
+- Win rate: 0% (no signals)
+- Trades/day: 0
+- P&L: €0
+
+### After Optimization (Virtual Testing)
+- Win rate: 41-48%
+- Trades/day: 40-80
+- P&L: €100-200/hour potential
+
+### Target (Real Trading)
+- Win rate: 50-60%
+- Trades/day: 30-50 (ETH + SOL only)
+- P&L: €50-100/day conservative
 
 ---
 

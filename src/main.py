@@ -248,17 +248,21 @@ class TradingBot:
         self.mode.activate()
     
     async def _check_signals(self) -> None:
-        """Check for trading signals across all assets."""
+        """Check for trading signals across all assets IN PARALLEL."""
         # Rate limit signal checking
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_signal_check_ms < self._signal_check_interval_ms:
             return
         self._last_signal_check_ms = now_ms
         
-        # Check signals for each asset
+        # Check signals for ALL assets simultaneously (parallel, not sequential)
         if self.multi_asset:
-            for asset in self.assets:
-                await self._check_signals_for_asset(asset)
+            # Use asyncio.gather to check all assets at the same time
+            # This ensures we don't miss opportunities while checking other assets
+            await asyncio.gather(
+                *[self._check_signals_for_asset(asset) for asset in self.assets],
+                return_exceptions=True  # Don't let one asset's error block others
+            )
         else:
             # Legacy single-asset mode
             await self._check_signals_for_asset("BTC")
@@ -363,8 +367,8 @@ class TradingBot:
             )
             return
         
-        # Score signal
-        scoring = self.confidence_scorer.score(signal)
+        # Score signal (pass asset for asset-specific scoring)
+        scoring = self.confidence_scorer.score(signal, asset=asset)
         signal.scoring = scoring
         signal.is_valid = True
         
