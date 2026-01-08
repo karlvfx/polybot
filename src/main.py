@@ -14,12 +14,15 @@ from typing import Optional
 import structlog
 
 # Performance optimization: Use uvloop for 2-4x faster asyncio
-try:
-    import uvloop
-    uvloop.install()
-    print("✅ uvloop installed - 2-4x faster async performance")
-except ImportError:
-    print("⚠️ uvloop not available - using standard asyncio")
+# NOTE: Disabled - was causing core dumps on some VPS systems
+# To re-enable: uncomment the try/except block below
+# try:
+#     import uvloop
+#     uvloop.install()
+#     print("✅ uvloop installed - 2-4x faster async performance")
+# except ImportError:
+#     print("⚠️ uvloop not available - using standard asyncio")
+print("ℹ️ Using standard asyncio")
 
 from config.settings import settings, OperatingMode
 from src.feeds.binance import BinanceFeed
