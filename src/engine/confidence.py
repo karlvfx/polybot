@@ -73,6 +73,7 @@ class ConfidenceScorer:
         self,
         spot_move_pct: float,
         pm_yes_price: float,
+        asset: str = "BTC",
     ) -> float:
         """
         Score spot-PM divergence (0.0 - 1.0).
@@ -82,25 +83,36 @@ class ConfidenceScorer:
         
         Higher divergence = higher score.
         
-        FIXED: Widened scoring range so typical divergences (5-10%) score well.
-        - 5% divergence = 0.0 (minimum threshold)
-        - 8% divergence = 0.6 (good score)
-        - 10% divergence = 1.0 (perfect score)
+        Asset-specific scoring:
+        - BTC: 8.5% threshold, tighter range (8.5-12%)
+        - ETH: 6.5% threshold, wider range for sensitivity (6.5-10%)
+        - SOL: 8% threshold, proven range (8-12%)
         """
-        # Calculate spot-implied probability
+        # Get asset-specific settings
+        asset_config = settings.asset_configs.get(asset)
+        scale = asset_config.spot_implied_scale or settings.signals.spot_implied_scale
+        min_div = asset_config.min_divergence_pct or settings.signals.min_divergence_pct
+        
+        # Calculate spot-implied probability (using asset-specific scale)
         spot_implied = calculate_spot_implied_prob(
             spot_move_pct,
-            scale=settings.signals.spot_implied_scale,
+            scale=scale,
         )
         
         # Calculate divergence
         divergence = abs(spot_implied - pm_yes_price)
         
-        # FIXED: Widened scoring range
-        # min_div (5%) = 0.0 score
-        # max_div (10%) = 1.0 score (was 15% - too strict!)
-        min_div = settings.signals.min_divergence_pct  # 0.05 (5%)
-        max_div = 0.10  # 10% divergence = perfect score (was 0.15)
+        # Asset-specific scoring ranges
+        # For each asset, perfect score at min_div + 4-5%
+        if asset == "BTC":
+            # BTC: 8.5% threshold → perfect at 12%
+            max_div = min_div + 0.035  # ~12%
+        elif asset == "ETH":
+            # ETH: 6.5% threshold → perfect at 10%
+            max_div = min_div + 0.035  # ~10%
+        else:  # SOL
+            # SOL: 8% threshold → perfect at 12%
+            max_div = min_div + 0.04  # ~12%
         
         if divergence < min_div:
             return 0.0
@@ -310,12 +322,13 @@ class ConfidenceScorer:
     # Main Scoring Method
     # ==========================================================================
     
-    def score(self, signal: SignalCandidate) -> ScoringData:
+    def score(self, signal: SignalCandidate, asset: str = "BTC") -> ScoringData:
         """
         Calculate confidence score using divergence-based strategy.
         
         Args:
             signal: The signal candidate to score
+            asset: Asset being traded (BTC, ETH, SOL) for per-asset adjustments
             
         Returns:
             ScoringData with total confidence and component breakdown
@@ -333,10 +346,11 @@ class ConfidenceScorer:
         # Primary Signals (55%)
         # ======================
         
-        # Divergence score (35%)
+        # Divergence score (35%) - uses asset-specific thresholds
         divergence_score = self._score_divergence(
             consensus.move_30s_pct,
             pm.yes_bid,
+            asset,
         )
         
         # PM staleness score (20%)
@@ -468,6 +482,7 @@ class ConfidenceScorer:
         
         self.logger.debug(
             "Confidence scored (divergence strategy)",
+            asset=asset,
             signal_id=signal.signal_id[:8] if signal.signal_id else "N/A",
             confidence=f"{confidence:.2%}",
             tier=self.get_confidence_tier(confidence),

@@ -365,3 +365,4 @@ htop
 
 Total: **~€52/year** for 24/7 professional hosting 🚀
 
+sudo systemctl stop polybot && sleep 2 && sudo journalctl -u polybot -n 300 --no-pager

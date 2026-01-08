@@ -56,6 +56,7 @@ class Position:
     entry_price: float
     size_eur: float
     entry_time_ms: int
+    asset: str = "BTC"  # Asset for per-asset execution parameters
     order_id: Optional[str] = None
     tx_hash: Optional[str] = None
     filled: bool = False
@@ -109,11 +110,12 @@ class ExecutionEngine:
     - Automatic exit handling
     - Pre-trade slippage simulation
     - Enhanced adaptive exit logic
+    - Asset-specific execution parameters (v2.0)
     """
     
-    # Exit condition thresholds
+    # Default exit condition thresholds (overridden by asset-specific config)
     STOP_LOSS_PCT = -0.03  # -3% stop loss
-    PARTIAL_EXIT_TRIGGER_PCT = 0.05  # +5% triggers partial exit
+    PARTIAL_EXIT_TRIGGER_PCT = 0.04  # +4% triggers partial exit (lowered for BTC/ETH)
     PARTIAL_EXIT_SIZE_PCT = 0.5  # Exit 50% of position
     ORACLE_UPDATE_IMMINENT_AGE = 65  # Exit if oracle age > 65s
     
@@ -243,6 +245,28 @@ class ExecutionEngine:
             return False, "Max concurrent positions reached"
         
         return True, None
+    
+    def _get_asset_execution_params(self, asset: str) -> dict:
+        """
+        Get asset-specific execution parameters.
+        
+        Returns dict with:
+        - time_limit_s: Position time limit
+        - take_profit_pct: Take profit target
+        - stop_loss_eur: Absolute stop loss in EUR
+        
+        Asset strategies:
+        - BTC "Scalpel": 60s time limit, 6% TP, €0.025 SL
+        - ETH "Sensitivity": 90s time limit, 6% TP, €0.03 SL
+        - SOL "Momentum": 120s time limit, 9% TP, €0.03 SL
+        """
+        asset_config = settings.asset_configs.get(asset)
+        
+        return {
+            "time_limit_s": asset_config.time_limit_s or settings.execution.time_based_exit_seconds,
+            "take_profit_pct": asset_config.take_profit_pct or settings.execution.take_profit_pct,
+            "stop_loss_eur": asset_config.stop_loss_eur or 0.03,
+        }
     
     async def _simulate_pre_trade_slippage(
         self,
@@ -527,22 +551,29 @@ class ExecutionEngine:
         self,
         position: Position,
         current_oracle_age: float,
+        asset_params: dict,
     ) -> float:
         """
         Calculate adaptive take profit target based on conditions.
         
+        Uses asset-specific base TP:
+        - BTC: 6% (fast exit, capture first repricing)
+        - ETH: 6% (doesn't overshoot like SOL)
+        - SOL: 9% (momentum plays, let it run)
+        
         Lower TP when oracle is stale (exit faster)
         Raise TP when initial mispricing was high (more potential)
         """
-        base_tp = settings.execution.take_profit_pct  # 8% default
+        # Use asset-specific base TP
+        base_tp = asset_params["take_profit_pct"]
         
         # If oracle is very stale (>50s), lower TP to exit faster
         if current_oracle_age > 50:
-            base_tp *= 0.7  # Reduce to ~5.6%
+            base_tp *= 0.8  # Reduce by 20%
         
-        # If initial mispricing was high (>5%), raise TP
+        # If initial mispricing was high (>5%), raise TP (but cap at 12%)
         if position.initial_mispricing > 0.05:
-            base_tp *= 1.3  # Increase to ~10.4%
+            base_tp = min(0.12, base_tp * 1.25)  # Increase by 25%, cap at 12%
         
         return base_tp
     
@@ -559,11 +590,11 @@ class ExecutionEngine:
         Exit conditions (in priority order):
         1. Oracle update imminent (age > 65s)
         2. Spread converged (market corrected)
-        3. Adaptive take profit (based on oracle age + initial mispricing)
-        4. Stop loss (-3%)
-        5. Partial exit at +5% (locks in gains)
-        6. Time-based exit (90s)
-        7. Emergency exit (120s)
+        3. Adaptive take profit (asset-specific: BTC 6%, ETH 6%, SOL 9%)
+        4. Stop loss (asset-specific: BTC €0.025, ETH/SOL €0.03)
+        5. Partial exit at 4% (locks in gains)
+        6. Time-based exit (asset-specific: BTC 60s, ETH 90s, SOL 120s)
+        7. Emergency exit (time_limit + 30s)
         
         Args:
             signal_id: ID of the signal/position
@@ -580,6 +611,9 @@ class ExecutionEngine:
         
         now_ms = int(time.time() * 1000)
         position_age_s = (now_ms - position.entry_time_ms) / 1000
+        
+        # Get asset-specific execution parameters
+        asset_params = self._get_asset_execution_params(position.asset)
         
         # Get oracle age if not provided
         if oracle_age is None and self._chainlink_feed:
@@ -619,60 +653,72 @@ class ExecutionEngine:
             return await self._close_position(position, current_price, ExitReason.SPREAD_CONVERGED)
         
         # ============================================
-        # EXIT CONDITION 3: Adaptive Take Profit
-        # Adjusts target based on oracle age and initial mispricing
+        # EXIT CONDITION 3: Adaptive Take Profit (Asset-Specific)
+        # BTC: 6%, ETH: 6%, SOL: 9%
         # ============================================
-        adaptive_tp = self._calculate_adaptive_take_profit(position, oracle_age)
+        adaptive_tp = self._calculate_adaptive_take_profit(position, oracle_age, asset_params)
         if profit_pct >= adaptive_tp:
             self.logger.info(
                 "Exiting: Adaptive take profit hit",
-                profit_pct=profit_pct,
-                target=adaptive_tp,
+                asset=position.asset,
+                profit_pct=f"{profit_pct:.2%}",
+                target=f"{adaptive_tp:.2%}",
             )
             return await self._close_position(position, current_price, ExitReason.TAKE_PROFIT)
         
         # ============================================
-        # EXIT CONDITION 4: Stop Loss (-3%)
-        # Protect against adverse moves
+        # EXIT CONDITION 4: Stop Loss (Asset-Specific)
+        # BTC: €0.025, ETH/SOL: €0.03
         # ============================================
-        if profit_pct < self.STOP_LOSS_PCT:
+        stop_loss_eur = asset_params["stop_loss_eur"]
+        price_drop = position.entry_price - current_price
+        if price_drop >= stop_loss_eur:
             self.logger.warning(
                 "Exiting: Stop loss hit",
-                profit_pct=profit_pct,
-                stop_loss=self.STOP_LOSS_PCT,
+                asset=position.asset,
+                price_drop=f"€{price_drop:.3f}",
+                stop_loss=f"€{stop_loss_eur:.3f}",
             )
             return await self._close_position(position, current_price, ExitReason.STOP_LOSS)
         
         # ============================================
-        # EXIT CONDITION 5: Partial Exit at +5%
-        # Lock in gains on half the position
+        # EXIT CONDITION 5: Partial Exit at +4%
+        # Lock in gains on half the position (lowered from 5% for BTC/ETH)
         # ============================================
         if profit_pct >= self.PARTIAL_EXIT_TRIGGER_PCT and not position.partial_exit_done:
             self.logger.info(
                 "Taking partial profit",
-                profit_pct=profit_pct,
+                asset=position.asset,
+                profit_pct=f"{profit_pct:.2%}",
                 exit_size_pct=self.PARTIAL_EXIT_SIZE_PCT,
             )
             await self._partial_exit(position, current_price, self.PARTIAL_EXIT_SIZE_PCT)
             # Don't return - continue monitoring remaining position
         
         # ============================================
-        # EXIT CONDITION 6: Time-Based Exit (90s)
+        # EXIT CONDITION 6: Time-Based Exit (Asset-Specific)
+        # BTC: 60s, ETH: 90s, SOL: 120s
         # ============================================
-        if position_age_s > settings.execution.time_based_exit_seconds:
+        time_limit = asset_params["time_limit_s"]
+        if position_age_s > time_limit:
             self.logger.info(
                 "Exiting: Time limit reached",
-                position_age=position_age_s,
+                asset=position.asset,
+                position_age=f"{position_age_s:.0f}s",
+                time_limit=f"{time_limit}s",
             )
             return await self._close_position(position, current_price, ExitReason.TIME_EXIT)
         
         # ============================================
-        # EXIT CONDITION 7: Emergency Exit (120s)
+        # EXIT CONDITION 7: Emergency Exit (time_limit + 30s)
         # ============================================
-        if position_age_s > settings.execution.max_position_duration_seconds:
+        emergency_limit = time_limit + 30
+        if position_age_s > emergency_limit:
             self.logger.warning(
                 "EMERGENCY EXIT: Max position duration exceeded",
-                position_age=position_age_s,
+                asset=position.asset,
+                position_age=f"{position_age_s:.0f}s",
+                emergency_limit=f"{emergency_limit}s",
             )
             return await self._close_position(position, current_price, ExitReason.EMERGENCY)
         

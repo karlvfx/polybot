@@ -222,18 +222,30 @@ class AssetSpecificSettings(BaseSettings):
     Per-asset configuration overrides.
     
     Different assets have different characteristics:
-    - BTC: Higher liquidity on PM, tighter spreads
-    - ETH: Medium liquidity
-    - SOL: Lower liquidity, wider spreads
+    - BTC: Efficient MMs (4-8s repricing), tight spreads → "Scalpel" strategy
+    - ETH: Medium efficiency (6-12s repricing), lower volatility → "Sensitivity" strategy  
+    - SOL: Slower MMs (10-15s repricing), high volatility → "Momentum" strategy
     
     These settings override the defaults in SignalSettings for specific assets.
     """
     
-    # Minimum liquidity to trade (EUR)
+    # Signal Detection
     min_liquidity_eur: Optional[float] = None
-    
-    # Minimum divergence to trigger signal (decimal, e.g., 0.05 = 5%)
     min_divergence_pct: Optional[float] = None
+    spot_implied_scale: Optional[float] = None  # Sigmoid sensitivity (100=standard, 130=sensitive)
+    
+    # Staleness Window (asset-specific MM repricing speeds)
+    optimal_staleness_min_s: Optional[float] = None  # Minimum staleness for opportunity
+    optimal_staleness_max_s: Optional[float] = None  # Maximum before edge evaporates
+    
+    # Execution Parameters
+    time_limit_s: Optional[float] = None  # Position time limit
+    take_profit_pct: Optional[float] = None  # Take profit target
+    stop_loss_eur: Optional[float] = None  # Absolute stop loss in EUR
+    
+    # Volatility Scaling (for ETH calm periods)
+    volatility_scale_enabled: Optional[bool] = None
+    volatility_scale_factor: Optional[float] = None  # Boost factor during low vol
     
     # Confidence threshold for alerts
     alert_confidence_threshold: Optional[float] = None
@@ -247,28 +259,88 @@ class AssetConfigs(BaseSettings):
     """
     Container for all asset-specific configurations.
     
+    Strategy per asset (based on MM efficiency analysis):
+    - BTC: "Scalpel" - High quality, fast exit (MMs reprice in 4-8s)
+    - ETH: "Sensitivity" - Lower threshold, volatility scaling (dormant periods)
+    - SOL: "Momentum" - Proven settings, longer hold (MMs slower, 10-15s)
+    
     Usage in .env:
         ASSET_BTC__MIN_LIQUIDITY_EUR=100
         ASSET_ETH__MIN_DIVERGENCE_PCT=0.08
     """
     
+    # BTC: "Scalpel" Strategy - Quality over quantity, fast exits
+    # MMs reprice in 4-8s, so we need higher divergence + faster exits
     BTC: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
-        min_liquidity_eur=50.0,  # Higher liquidity available
-        min_divergence_pct=0.07,  # 7% - raised from 5% (MMs reprice faster on BTC)
+        # Signal Detection
+        min_liquidity_eur=50.0,
+        min_divergence_pct=0.085,  # 8.5% - quality filter (↑ from 7%)
+        spot_implied_scale=100.0,  # Standard sensitivity
+        
+        # Staleness Window (BTC MMs are fastest)
+        optimal_staleness_min_s=4.0,   # 4s minimum (not 8s)
+        optimal_staleness_max_s=10.0,  # 10s max (not 12s)
+        
+        # Execution - Fast in, fast out
+        time_limit_s=60.0,        # ↓ from 90s - exit before MM reprices
+        take_profit_pct=0.06,     # ↓ from 8% - capture first repricing
+        stop_loss_eur=0.025,      # ↓ from €0.03 - tighter for tight spreads
+        
+        # No volatility scaling for BTC
+        volatility_scale_enabled=False,
+        
+        # Price range
         min_price=0.05,
         max_price=0.95,
     ))
     
+    # ETH: "Sensitivity" Strategy - Unlock dormant asset
+    # Lower volatility means smaller moves are more significant
     ETH: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
-        min_liquidity_eur=40.0,  # Medium liquidity
-        min_divergence_pct=0.07,  # 7% - raised from 6% (match BTC quality filter)
+        # Signal Detection - More sensitive
+        min_liquidity_eur=30.0,   # ↓ from 40€ - unlock thinner setups
+        min_divergence_pct=0.065, # 6.5% - catch smaller divergences (↓ from 7%)
+        spot_implied_scale=130.0, # ↑ from 100 - more sensitive to small moves
+        
+        # Staleness Window (ETH MMs slightly slower than BTC)
+        optimal_staleness_min_s=8.0,
+        optimal_staleness_max_s=15.0,
+        
+        # Execution
+        time_limit_s=90.0,        # Keep standard
+        take_profit_pct=0.06,     # ↓ from 8% - ETH doesn't overshoot
+        stop_loss_eur=0.03,       # Keep current
+        
+        # Volatility scaling - boost sensitivity during calm periods
+        volatility_scale_enabled=True,
+        volatility_scale_factor=1.3,  # 30% boost during low vol
+        
+        # Price range
         min_price=0.08,
         max_price=0.92,
     ))
     
+    # SOL: "Momentum" Strategy - Keep winning, extend gains
+    # Slower MMs (10-15s), higher volatility = let positions breathe
     SOL: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
-        min_liquidity_eur=30.0,  # Lower liquidity typical
-        min_divergence_pct=0.08,  # 8% - proven profitable, keep as-is
+        # Signal Detection - Keep proven settings
+        min_liquidity_eur=30.0,
+        min_divergence_pct=0.08,  # 8% - proven profitable
+        spot_implied_scale=100.0, # Standard sensitivity
+        
+        # Staleness Window
+        optimal_staleness_min_s=8.0,
+        optimal_staleness_max_s=12.0,
+        
+        # Execution - Let momentum play out
+        time_limit_s=120.0,       # ↑ from 90s - SOL trends
+        take_profit_pct=0.09,     # ↑ from 8% - SOL overshoots
+        stop_loss_eur=0.03,       # Keep current
+        
+        # No volatility scaling for SOL
+        volatility_scale_enabled=False,
+        
+        # Price range
         min_price=0.10,
         max_price=0.90,
     ))

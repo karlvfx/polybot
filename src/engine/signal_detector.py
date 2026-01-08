@@ -41,6 +41,8 @@ def calculate_spot_implied_prob(momentum_velocity: float, scale: float = 100.0) 
     Args:
         momentum_velocity: 30s price change as decimal (e.g., 0.01 = 1% up)
         scale: Sensitivity factor (higher = sharper probability curve)
+               - 100 = standard (BTC, SOL)
+               - 130 = sensitive (ETH) - makes smaller moves more significant
     
     Returns:
         Implied probability of UP (0.0 to 1.0)
@@ -51,6 +53,10 @@ def calculate_spot_implied_prob(momentum_velocity: float, scale: float = 100.0) 
         - +1% move → ~73% probability  
         - +2% move → ~88% probability
         - -1% move → ~27% probability
+        
+    With scale=130 (ETH):
+        - +0.5% move → ~65% probability (vs ~62% at scale=100)
+        - +0.7% move → ~71% probability (vs ~67% at scale=100)
     """
     # Logistic function: 1 / (1 + e^(-x))
     # momentum_velocity is in decimal form (0.01 = 1%)
@@ -100,6 +106,7 @@ class SignalDetector:
         self,
         consensus: ConsensusData,
         pm_data: PolymarketData,
+        asset: str = "BTC",
     ) -> DivergenceData:
         """
         Calculate spot-PM divergence - the core signal.
@@ -107,17 +114,42 @@ class SignalDetector:
         Args:
             consensus: Spot price data from exchanges
             pm_data: Polymarket orderbook data
+            asset: Asset being traded (for asset-specific scaling)
             
         Returns:
             DivergenceData with all divergence metrics
         """
+        # Get asset-specific settings
+        asset_config = settings.asset_configs.get(asset)
+        
         # Get spot price momentum (30s move)
         spot_move = consensus.move_30s_pct
         
+        # Asset-specific sigmoid scale (ETH=130 for sensitivity, others=100)
+        scale = asset_config.spot_implied_scale or settings.signals.spot_implied_scale
+        
+        # Apply volatility scaling for ETH during calm periods
+        effective_spot_move = spot_move
+        if asset_config.volatility_scale_enabled and consensus.volatility_30s > 0:
+            base_volatility = 0.002  # 0.2% typical volatility
+            volatility_ratio = consensus.volatility_30s / base_volatility
+            
+            if volatility_ratio < 0.8:  # Calm period
+                # Boost sensitivity (makes smaller moves more significant)
+                scale_factor = asset_config.volatility_scale_factor or 1.0
+                effective_spot_move = spot_move * scale_factor
+                self.logger.debug(
+                    f"Volatility scaling applied for {asset}",
+                    original_move=f"{spot_move:.4%}",
+                    effective_move=f"{effective_spot_move:.4%}",
+                    volatility_ratio=f"{volatility_ratio:.2f}",
+                    scale_factor=scale_factor,
+                )
+        
         # Calculate what spot move implies for UP probability
         spot_implied = calculate_spot_implied_prob(
-            spot_move,
-            scale=settings.signals.spot_implied_scale,
+            effective_spot_move,
+            scale=scale,
         )
         
         # PM implied probability (YES price = UP probability)
@@ -140,13 +172,16 @@ class SignalDetector:
         # A 50% divergence with stale PM = MASSIVE opportunity, not a problem!
         HIGH_DIV_OVERRIDE_PCT = 0.30  # 30% divergence bypasses staleness check
         
+        # Use asset-specific min divergence
+        min_div = asset_config.min_divergence_pct or settings.signals.min_divergence_pct
+        
         if divergence >= HIGH_DIV_OVERRIDE_PCT:
             # High divergence = always actionable (staleness doesn't matter)
             is_actionable = True
         else:
             # Normal case: need divergence AND fresh-ish PM data
             is_actionable = (
-                divergence >= settings.signals.min_divergence_pct and
+                divergence >= min_div and
                 pm_age <= settings.signals.max_pm_staleness_seconds
             )
         
@@ -157,7 +192,7 @@ class SignalDetector:
             pm_orderbook_age_seconds=pm_age,
             signal_direction=direction,
             is_actionable=is_actionable,
-            min_divergence=settings.signals.min_divergence_pct,
+            min_divergence=min_div,
             min_pm_age=settings.signals.min_pm_staleness_seconds,
         )
     
@@ -479,8 +514,8 @@ class SignalDetector:
             )
             return None
         
-        # Calculate divergence (core signal)
-        divergence_data = self.calculate_divergence(consensus, pm_data)
+        # Calculate divergence (core signal) - pass asset for per-asset scaling
+        divergence_data = self.calculate_divergence(consensus, pm_data, asset)
         
         # Log divergence state
         self.logger.debug(
