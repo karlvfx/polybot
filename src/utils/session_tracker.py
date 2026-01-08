@@ -524,17 +524,60 @@ class SessionTracker:
         
         lines.append("")
         
-        # Trade details
+        # Trade details - winning trades
         if summary["trade_details"]:
-            lines.append("## 📋 Trade Details")
-            for trade in summary["trade_details"][-10:]:  # Last 10 trades
-                lines.append(
-                    f"{trade['result']} **{trade['asset']} {trade['direction']}** | "
-                    f"Entry: {trade['entry']} → Exit: {trade['exit']} | "
-                    f"Duration: {trade['duration']} | "
-                    f"Net: {trade['net']} ({trade['exit_reason']})"
-                )
-            lines.append("")
+            winning_trades = [t for t in summary["trade_details"] if t['result'] == '✅']
+            losing_trades = [t for t in summary["trade_details"] if t['result'] == '❌']
+            
+            # Show last 10 winning trades
+            if winning_trades:
+                lines.append("## ✅ Winning Trades (Last 10)")
+                for trade in winning_trades[-10:]:
+                    lines.append(
+                        f"**{trade['asset']} {trade['direction']}** | "
+                        f"Entry: {trade['entry']} → Exit: {trade['exit']} | "
+                        f"Duration: {trade['duration']} | "
+                        f"Net: {trade['net']} ({trade['exit_reason']})"
+                    )
+                lines.append("")
+            
+            # Show losing trades with analysis
+            if losing_trades:
+                lines.append("## ❌ Losing Trades Analysis")
+                
+                # Group losses by asset
+                losses_by_asset = {}
+                for trade in losing_trades:
+                    asset = trade['asset']
+                    if asset not in losses_by_asset:
+                        losses_by_asset[asset] = {'count': 0, 'total_loss': 0.0, 'reasons': {}}
+                    losses_by_asset[asset]['count'] += 1
+                    # Parse the net value (e.g., "€-5.00" -> -5.00)
+                    try:
+                        net_val = float(trade['net'].replace('€', '').replace('+', ''))
+                        losses_by_asset[asset]['total_loss'] += net_val
+                    except:
+                        pass
+                    # Track exit reasons
+                    reason = trade['exit_reason']
+                    losses_by_asset[asset]['reasons'][reason] = losses_by_asset[asset]['reasons'].get(reason, 0) + 1
+                
+                # Summary by asset
+                lines.append("**Losses by Asset:**")
+                for asset, data in sorted(losses_by_asset.items(), key=lambda x: x[1]['total_loss']):
+                    reasons_str = ", ".join([f"{r}: {c}" for r, c in data['reasons'].items()])
+                    lines.append(f"  • **{asset}**: {data['count']} losses = €{data['total_loss']:.2f} ({reasons_str})")
+                lines.append("")
+                
+                # Show last 10 losing trades with details
+                lines.append("**Recent Losing Trades:**")
+                for trade in losing_trades[-10:]:
+                    lines.append(
+                        f"  ❌ **{trade['asset']} {trade['direction']}** | "
+                        f"{trade['entry']} → {trade['exit']} | "
+                        f"{trade['net']} | *{trade['exit_reason']}*"
+                    )
+                lines.append("")
         
         # Missed opportunities
         missed = summary["missed_opportunities"]

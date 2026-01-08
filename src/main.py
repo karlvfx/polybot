@@ -896,11 +896,46 @@ class TradingBot:
                 print(f"  • {feed}: {stats['uptime_pct']:.1f}% uptime, {stats['reconnects']} reconnects")
             
             if session_summary['trade_details']:
-                print("\nTrade Details:")
-                for trade in session_summary['trade_details'][-10:]:
-                    print(f"  {trade['result']} {trade['asset']} {trade['direction']}: "
-                          f"{trade['entry']}→{trade['exit']} | {trade['duration']} | "
-                          f"Net: {trade['net']} ({trade['exit_reason']})")
+                winning_trades = [t for t in session_summary['trade_details'] if t['result'] == '✅']
+                losing_trades = [t for t in session_summary['trade_details'] if t['result'] == '❌']
+                
+                # Show winning trades summary
+                if winning_trades:
+                    print(f"\n✅ Winning Trades: {len(winning_trades)}")
+                    for trade in winning_trades[-5:]:  # Last 5 wins
+                        print(f"  {trade['asset']} {trade['direction']}: "
+                              f"{trade['entry']}→{trade['exit']} | {trade['net']} ({trade['exit_reason']})")
+                
+                # Show losing trades with analysis
+                if losing_trades:
+                    print(f"\n❌ Losing Trades Analysis: {len(losing_trades)} total")
+                    
+                    # Group losses by asset
+                    losses_by_asset = {}
+                    for trade in losing_trades:
+                        asset = trade['asset']
+                        if asset not in losses_by_asset:
+                            losses_by_asset[asset] = {'count': 0, 'total_loss': 0.0, 'reasons': {}}
+                        losses_by_asset[asset]['count'] += 1
+                        try:
+                            net_val = float(trade['net'].replace('€', '').replace('+', ''))
+                            losses_by_asset[asset]['total_loss'] += net_val
+                        except:
+                            pass
+                        reason = trade['exit_reason']
+                        losses_by_asset[asset]['reasons'][reason] = losses_by_asset[asset]['reasons'].get(reason, 0) + 1
+                    
+                    # Summary by asset
+                    print("  Losses by Asset:")
+                    for asset, data in sorted(losses_by_asset.items(), key=lambda x: x[1]['total_loss']):
+                        reasons_str = ", ".join([f"{r}: {c}" for r, c in data['reasons'].items()])
+                        print(f"    {asset}: {data['count']} losses = €{data['total_loss']:.2f} ({reasons_str})")
+                    
+                    # Show last 5 losing trades
+                    print("  Recent Losses:")
+                    for trade in losing_trades[-5:]:
+                        print(f"    {trade['asset']} {trade['direction']}: "
+                              f"{trade['entry']}→{trade['exit']} | {trade['net']} ({trade['exit_reason']})")
             
             print("="*60 + "\n")
         except Exception as e:

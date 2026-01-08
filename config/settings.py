@@ -254,21 +254,21 @@ class AssetConfigs(BaseSettings):
     
     BTC: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         min_liquidity_eur=50.0,  # Higher liquidity available
-        min_divergence_pct=0.05,  # 5%
+        min_divergence_pct=0.07,  # 7% - raised from 5% (MMs reprice faster on BTC)
         min_price=0.05,
         max_price=0.95,
     ))
     
     ETH: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         min_liquidity_eur=40.0,  # Medium liquidity
-        min_divergence_pct=0.06,  # 6% - slightly higher threshold
+        min_divergence_pct=0.07,  # 7% - raised from 6% (match BTC quality filter)
         min_price=0.08,
         max_price=0.92,
     ))
     
     SOL: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         min_liquidity_eur=30.0,  # Lower liquidity typical
-        min_divergence_pct=0.08,  # 8% - need bigger edge
+        min_divergence_pct=0.08,  # 8% - proven profitable, keep as-is
         min_price=0.10,
         max_price=0.90,
     ))
