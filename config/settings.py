@@ -269,25 +269,24 @@ class AssetConfigs(BaseSettings):
         ASSET_ETH__MIN_DIVERGENCE_PCT=0.08
     """
     
-    # BTC: "Scalpel" Strategy - Quality over quantity, fast exits
-    # MMs reprice in 4-8s, so we need higher divergence + faster exits
-    # v2.1: Raised threshold to 10%, loosened stop loss (too many stop-outs)
+    # BTC: DISABLED for v2.2 - too many losses (117 losses = €-317 in testing)
+    # MMs reprice too fast (4-8s), causing stop losses and liquidity collapses
+    # Re-enable later with US VPS for lower latency
     BTC: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
-        # Signal Detection
-        min_liquidity_eur=40.0,   # ↓ from 50 - was causing liquidity collapse exits
-        min_divergence_pct=0.10,  # 10% - only trade extreme events (↑ from 8.5%)
-        spot_implied_scale=100.0,  # Standard sensitivity
+        # Signal Detection - EFFECTIVELY DISABLED
+        min_liquidity_eur=40.0,
+        min_divergence_pct=0.15,  # 15% - effectively disabled (rarely hit)
+        spot_implied_scale=100.0,
         
-        # Staleness Window (BTC MMs are fastest)
-        optimal_staleness_min_s=4.0,   # 4s minimum (not 8s)
-        optimal_staleness_max_s=10.0,  # 10s max (not 12s)
+        # Staleness Window
+        optimal_staleness_min_s=4.0,
+        optimal_staleness_max_s=10.0,
         
-        # Execution - Fast in, fast out
-        time_limit_s=60.0,        # ↓ from 90s - exit before MM reprices
-        take_profit_pct=0.06,     # ↓ from 8% - capture first repricing
-        stop_loss_eur=0.035,      # ↑ from 0.025 - was too tight, triggering too often
+        # Execution
+        time_limit_s=60.0,
+        take_profit_pct=0.06,
+        stop_loss_eur=0.035,
         
-        # No volatility scaling for BTC
         volatility_scale_enabled=False,
         
         # Price range
@@ -322,24 +321,24 @@ class AssetConfigs(BaseSettings):
         max_price=0.92,
     ))
     
-    # SOL: "Momentum" Strategy - Keep winning, extend gains
+    # SOL: "Momentum" Strategy - THE PROFIT ENGINE
     # Slower MMs (10-15s), higher volatility = let positions breathe
+    # v2.2: Lowered liquidity to €15 to catch 27% divergence opportunities
     SOL: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
-        # Signal Detection - Keep proven settings
-        min_liquidity_eur=30.0,
+        # Signal Detection
+        min_liquidity_eur=15.0,   # ↓ from 30 - was missing 27% div opportunities
         min_divergence_pct=0.08,  # 8% - proven profitable
-        spot_implied_scale=100.0, # Standard sensitivity
+        spot_implied_scale=100.0,
         
         # Staleness Window
         optimal_staleness_min_s=8.0,
         optimal_staleness_max_s=12.0,
         
         # Execution - Let momentum play out
-        time_limit_s=120.0,       # ↑ from 90s - SOL trends
-        take_profit_pct=0.09,     # ↑ from 8% - SOL overshoots
-        stop_loss_eur=0.03,       # Keep current
+        time_limit_s=120.0,       # SOL trends longer
+        take_profit_pct=0.09,     # 9% - SOL overshoots
+        stop_loss_eur=0.03,
         
-        # No volatility scaling for SOL
         volatility_scale_enabled=False,
         
         # Price range
