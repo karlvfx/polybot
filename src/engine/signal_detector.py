@@ -273,6 +273,7 @@ class SignalDetector:
         if divergence_data.divergence >= HIGH_DIV_OVERRIDE_THRESHOLD:
             self.logger.info(
                 "🚀 HIGH DIVERGENCE OVERRIDE - Bypassing supporting filters",
+                asset=asset,
                 divergence=f"{divergence_data.divergence:.1%}",
                 threshold=f"{HIGH_DIV_OVERRIDE_THRESHOLD:.0%}",
             )
@@ -591,10 +592,14 @@ class SignalDetector:
         # All checks passed - create signal candidate
         now_ms = int(time.time() * 1000)
         
+        # Get asset from context
+        asset = getattr(self, '_current_asset', 'BTC')
+        
         signal = SignalCandidate(
             signal_id=str(uuid4()),
             timestamp_ms=now_ms,
             market_id=pm_data.market_id,
+            asset=asset,  # Include asset in signal
             direction=direction,
             signal_type=SignalType.STANDARD,
             consensus=consensus,
@@ -606,7 +611,6 @@ class SignalDetector:
         self._recent_signals.append((now_ms, direction.value))
         
         # Record detected signal in session tracker
-        asset = getattr(self, '_current_asset', 'BTC')  # Get asset from context
         session_tracker.record_signal_detected(
             asset=asset,
             direction=direction.value,
@@ -619,6 +623,7 @@ class SignalDetector:
         
         self.logger.info(
             "🎯 SIGNAL DETECTED (Divergence Strategy)",
+            asset=asset,
             signal_id=signal.signal_id[:8],
             direction=direction.value,
             divergence=f"{divergence_data.divergence:.2%}",

@@ -542,6 +542,7 @@ class SignalCandidate:
     signal_id: str = field(default_factory=lambda: str(uuid4()))
     timestamp_ms: int = 0
     market_id: str = ""
+    asset: str = "BTC"  # Asset this signal is for (BTC, ETH, SOL)
     direction: SignalDirection = SignalDirection.UP
     signal_type: SignalType = SignalType.STANDARD
     

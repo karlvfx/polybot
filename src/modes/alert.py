@@ -163,6 +163,7 @@ class AlertMode(BaseMode):
         if breakdown and breakdown.divergence >= HIGH_DIV_OVERRIDE:
             self.logger.info(
                 "🚀 HIGH DIVERGENCE OVERRIDE - Processing despite low confidence",
+                asset=signal.asset,
                 confidence=f"{confidence:.1%}",
                 divergence_score=f"{breakdown.divergence:.1%}",
             )
@@ -171,6 +172,7 @@ class AlertMode(BaseMode):
             # Log rejection with breakdown
             self.logger.info(
                 "📊 Signal below threshold",
+                asset=signal.asset,
                 confidence=f"{confidence:.1%}",
                 threshold=f"{threshold:.1%}",
                 divergence=f"{breakdown.divergence:.1%}" if breakdown else "N/A",
@@ -183,6 +185,7 @@ class AlertMode(BaseMode):
             # Signal meets threshold!
             self.logger.info(
                 "✅ Signal meets threshold!",
+                asset=signal.asset,
                 confidence=f"{confidence:.1%}",
                 threshold=f"{threshold:.1%}",
             )
