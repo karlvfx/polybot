@@ -1,5 +1,8 @@
 """
 Discord alerting system with rich embeds for virtual trading.
+
+Uses a persistent HTTP client with connection pooling for reliability.
+Non-blocking sends to avoid impacting trading performance.
 """
 
 import asyncio
@@ -17,47 +20,78 @@ class DiscordAlerter:
     """
     Discord webhook alerter for trading notifications.
     
-    Sends rich embeds with:
-    - Signal alerts with full context
-    - Virtual position updates
-    - Position closure summaries
-    - Performance summaries
-    - Error alerts
+    Features:
+    - Persistent HTTP client (no connection drops!)
+    - Connection pooling for reliability
+    - Non-blocking sends for critical paths
+    - Automatic reconnection on failure
     """
     
-    # Retry settings - keep it fast to not block bot
-    MAX_RETRIES = 2  # Reduced from 3
-    RETRY_DELAYS = [0.5, 1.0]  # Faster retries
+    # Retry settings
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [1.0, 2.0, 5.0]  # Progressive backoff
     
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
         self.logger = logger.bind(component="discord_alerter")
         self._rate_limit_until: float = 0
         self._consecutive_failures = 0
+        
+        # Persistent HTTP client with connection pooling
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_lock = asyncio.Lock()
+        self._last_success_time: float = 0
     
-    def _get_timeout(self) -> httpx.Timeout:
-        """Get timeout configuration - keep short to not block bot."""
-        return httpx.Timeout(
-            connect=5.0,   # Fast connection timeout
-            read=5.0,      # Fast read timeout
-            write=5.0,     # Fast write timeout
-            pool=5.0,      # Fast pool timeout
-        )
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create the persistent HTTP client."""
+        async with self._client_lock:
+            # Recreate client if it's been failing or doesn't exist
+            if self._client is None or self._consecutive_failures >= 3:
+                if self._client:
+                    try:
+                        await self._client.aclose()
+                    except Exception:
+                        pass
+                
+                self._client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(
+                        connect=10.0,   # Longer connect timeout
+                        read=15.0,      # Longer read timeout
+                        write=10.0,     # Longer write timeout
+                        pool=10.0,      # Pool timeout
+                    ),
+                    limits=httpx.Limits(
+                        max_keepalive_connections=5,
+                        max_connections=10,
+                        keepalive_expiry=60.0,  # Keep connections alive for 60s
+                    ),
+                    http2=True,  # Use HTTP/2 for better performance
+                )
+                self._consecutive_failures = 0
+                self.logger.debug("Created new Discord HTTP client")
+            
+            return self._client
     
     async def close(self):
-        """Close the HTTP client (no-op now, using fresh clients)."""
-        pass
+        """Close the HTTP client."""
+        if self._client:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
     
     # ==========================================================================
     # Core Methods
     # ==========================================================================
     
-    async def _send_with_retry(self, payload: dict) -> bool:
+    async def _send_with_retry(self, payload: dict, blocking: bool = True) -> bool:
         """
         Send payload to Discord with retry logic.
         
         Args:
             payload: JSON payload to send
+            blocking: If False, fire-and-forget (don't block trading)
             
         Returns:
             True if sent successfully
@@ -66,63 +100,64 @@ class DiscordAlerter:
             return False
         
         if time.time() < self._rate_limit_until:
-            self.logger.warning("Rate limited, skipping message")
-            return False
+            return False  # Silent skip when rate limited
+        
+        # Non-blocking mode: fire and forget
+        if not blocking:
+            asyncio.create_task(self._send_with_retry(payload, blocking=True))
+            return True
         
         last_error = None
         
         for attempt in range(self.MAX_RETRIES):
             try:
-                # Use fresh client per request to avoid stale connection issues
-                async with httpx.AsyncClient(timeout=self._get_timeout()) as client:
-                    response = await client.post(
-                        self.webhook_url,
-                        json=payload,
-                    )
+                client = await self._get_client()
+                response = await client.post(
+                    self.webhook_url,
+                    json=payload,
+                )
                 
                 if response.status_code == 429:
                     retry_after = response.json().get("retry_after", 5)
                     self._rate_limit_until = time.time() + retry_after
-                    self.logger.warning("Rate limited by Discord", retry_after=retry_after)
+                    self.logger.debug("Discord rate limited", retry_after=retry_after)
                     return False
                 
                 if response.status_code in (200, 204):
                     self._consecutive_failures = 0
+                    self._last_success_time = time.time()
                     return True
                 
                 response.raise_for_status()
                 return True
                 
-            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.PoolTimeout) as e:
                 last_error = e
                 self._consecutive_failures += 1
                 
                 if attempt < self.MAX_RETRIES - 1:
-                    delay = self.RETRY_DELAYS[attempt]
-                    self.logger.warning(
-                        "Discord connection failed, retrying",
-                        attempt=attempt + 1,
-                        max_retries=self.MAX_RETRIES,
-                        delay=delay,
-                        error_type=type(e).__name__,
-                    )
+                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
                     await asyncio.sleep(delay)
-                    
-                    # Reset client on connection errors
-                    await self.close()
                     
             except Exception as e:
                 last_error = e
                 self._consecutive_failures += 1
+                # Force client recreation
+                async with self._client_lock:
+                    if self._client:
+                        try:
+                            await self._client.aclose()
+                        except Exception:
+                            pass
+                        self._client = None
                 break
         
-        # All retries failed
-        self.logger.error(
-            "Failed to send to Discord after retries",
-            error=str(last_error),
-            error_type=type(last_error).__name__,
-            consecutive_failures=self._consecutive_failures,
-        )
+        # Only log if we haven't had success recently (reduce log spam)
+        if time.time() - self._last_success_time > 120:
+            self.logger.warning(
+                "Discord connectivity issues",
+                failures=self._consecutive_failures,
+            )
         return False
     
     async def send_message(self, content: str) -> bool:
