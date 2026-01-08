@@ -271,10 +271,11 @@ class AssetConfigs(BaseSettings):
     
     # BTC: "Scalpel" Strategy - Quality over quantity, fast exits
     # MMs reprice in 4-8s, so we need higher divergence + faster exits
+    # v2.1: Raised threshold to 10%, loosened stop loss (too many stop-outs)
     BTC: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         # Signal Detection
-        min_liquidity_eur=50.0,
-        min_divergence_pct=0.085,  # 8.5% - quality filter (↑ from 7%)
+        min_liquidity_eur=40.0,   # ↓ from 50 - was causing liquidity collapse exits
+        min_divergence_pct=0.10,  # 10% - only trade extreme events (↑ from 8.5%)
         spot_implied_scale=100.0,  # Standard sensitivity
         
         # Staleness Window (BTC MMs are fastest)
@@ -284,7 +285,7 @@ class AssetConfigs(BaseSettings):
         # Execution - Fast in, fast out
         time_limit_s=60.0,        # ↓ from 90s - exit before MM reprices
         take_profit_pct=0.06,     # ↓ from 8% - capture first repricing
-        stop_loss_eur=0.025,      # ↓ from €0.03 - tighter for tight spreads
+        stop_loss_eur=0.035,      # ↑ from 0.025 - was too tight, triggering too often
         
         # No volatility scaling for BTC
         volatility_scale_enabled=False,
@@ -296,9 +297,10 @@ class AssetConfigs(BaseSettings):
     
     # ETH: "Sensitivity" Strategy - Unlock dormant asset
     # Lower volatility means smaller moves are more significant
+    # v2.1: Lowered liquidity to €15 to unlock 24-29% divergence opportunities
     ETH: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         # Signal Detection - More sensitive
-        min_liquidity_eur=30.0,   # ↓ from 40€ - unlock thinner setups
+        min_liquidity_eur=15.0,   # ↓ from 30€ - unlock high-div opportunities (was rejecting 24-29% divs)
         min_divergence_pct=0.065, # 6.5% - catch smaller divergences (↓ from 7%)
         spot_implied_scale=130.0, # ↑ from 100 - more sensitive to small moves
         
