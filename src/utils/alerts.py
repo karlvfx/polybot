@@ -55,17 +55,19 @@ class DiscordAlerter:
                 
                 self._client = httpx.AsyncClient(
                     timeout=httpx.Timeout(
-                        connect=10.0,   # Longer connect timeout
-                        read=15.0,      # Longer read timeout
-                        write=10.0,     # Longer write timeout
-                        pool=10.0,      # Pool timeout
+                        connect=15.0,   # Longer connect timeout
+                        read=20.0,      # Longer read timeout  
+                        write=15.0,     # Longer write timeout
+                        pool=15.0,      # Pool timeout
                     ),
                     limits=httpx.Limits(
-                        max_keepalive_connections=5,
-                        max_connections=10,
-                        keepalive_expiry=60.0,  # Keep connections alive for 60s
+                        max_keepalive_connections=3,
+                        max_connections=5,
+                        keepalive_expiry=30.0,  # Keep connections alive for 30s
                     ),
-                    http2=True,  # Use HTTP/2 for better performance
+                    http2=False,  # Disabled HTTP/2 - can cause issues on some VPS
+                    verify=True,  # SSL verification
+                    follow_redirects=True,
                 )
                 self._consecutive_failures = 0
                 self.logger.debug("Created new Discord HTTP client")
@@ -134,6 +136,13 @@ class DiscordAlerter:
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.PoolTimeout) as e:
                 last_error = e
                 self._consecutive_failures += 1
+                
+                # Log specific error type for debugging
+                self.logger.debug(
+                    "Discord send failed",
+                    error_type=type(e).__name__,
+                    attempt=attempt + 1,
+                )
                 
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
