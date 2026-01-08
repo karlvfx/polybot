@@ -101,6 +101,9 @@ class SignalSettings(BaseSettings):
     max_pm_staleness_seconds: float = 900.0  # 15 minutes - very generous for quiet markets
     soft_stale_threshold_seconds: float = 600.0  # Start soft penalty after 10 min
     
+    # High divergence override - bypass supporting filters if divergence is massive
+    high_divergence_override_pct: float = 0.30  # 30% divergence = always trade
+    
     # Spot-implied probability scaling
     # Controls how sensitive the probability is to price moves
     # scale=100: 1% move → ~73% prob, 2% move → ~88% prob
