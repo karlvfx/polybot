@@ -223,6 +223,7 @@ class SignalDetector:
         consensus: ConsensusData,
         pm_data: PolymarketData,
         divergence_data: DivergenceData,
+        asset: str = "BTC",
     ) -> tuple[bool, Optional[RejectionReason]]:
         """
         Check supporting conditions (volume, spike, liquidity).
@@ -308,16 +309,20 @@ class SignalDetector:
             )
             return False, RejectionReason.VOLATILITY_TOO_HIGH
         
-        # Liquidity check
-        if pm_data.yes_liquidity_best < settings.signals.min_liquidity_eur:
+        # Liquidity check - uses asset-specific minimum if available
+        asset_config = settings.asset_configs.get(asset)
+        min_liq = asset_config.min_liquidity_eur or settings.signals.min_liquidity_eur
+        
+        if pm_data.yes_liquidity_best < min_liq:
             self._track_rejection(
                 "liquidity_low", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
                 divergence_data.signal_direction, consensus, pm_data
             )
             self.logger.info(
                 "❌ Rejected: PM liquidity too low",
+                asset=asset,
                 liquidity=f"€{pm_data.yes_liquidity_best:.2f}",
-                required=f"€{settings.signals.min_liquidity_eur:.2f}",
+                required=f"€{min_liq:.2f}",
             )
             return False, RejectionReason.LIQUIDITY_LOW
         
@@ -405,20 +410,29 @@ class SignalDetector:
         consensus: ConsensusData,
         oracle: Optional[OracleData],
         pm_data: PolymarketData,
+        asset: str = "BTC",
     ) -> Optional[SignalCandidate]:
         """
         Detect if current market state presents a trading opportunity.
         
         NEW: Uses divergence-based detection as primary signal.
+        NEW: Supports per-asset configuration for different thresholds.
         
         Args:
             consensus: Aggregated spot price data
             oracle: Chainlink oracle data (optional, not primary signal anymore)
             pm_data: Polymarket orderbook data
+            asset: Asset being traded (BTC, ETH, SOL) for per-asset config
             
         Returns:
             SignalCandidate if opportunity detected, None otherwise
         """
+        # Get asset-specific settings (fall back to global defaults)
+        asset_config = settings.asset_configs.get(asset)
+        min_liquidity = asset_config.min_liquidity_eur or settings.signals.min_liquidity_eur
+        min_divergence = asset_config.min_divergence_pct or settings.signals.min_divergence_pct
+        min_price = asset_config.min_price or 0.05
+        max_price = asset_config.max_price or 0.95
         # EARLY CHECK: Reject if PM data is empty/invalid
         # This prevents generating signals for assets without active markets
         if pm_data.yes_bid <= 0.0 and pm_data.no_bid <= 0.0:
@@ -447,6 +461,24 @@ class SignalDetector:
             )
             return None
         
+        # ASSET-SPECIFIC PRICE RANGE FILTER
+        # Different assets have different acceptable price ranges based on their PM liquidity
+        # Low prices (e.g., $0.05) = thin liquidity, high volatility, risky
+        # High prices (e.g., $0.95) = expensive to buy, limited upside
+        entry_price = pm_data.yes_bid  # The price we'd pay for YES
+        if entry_price < min_price or entry_price > max_price:
+            self.logger.debug(
+                "PM price outside asset-specific range",
+                asset=asset,
+                entry_price=f"${entry_price:.2f}",
+                allowed_range=f"${min_price:.2f}-${max_price:.2f}",
+            )
+            self._track_rejection(
+                "price_out_of_range", 0.0, pm_data.orderbook_age_seconds,
+                "UNKNOWN", consensus, pm_data
+            )
+            return None
+        
         # Calculate divergence (core signal)
         divergence_data = self.calculate_divergence(consensus, pm_data)
         
@@ -461,10 +493,19 @@ class SignalDetector:
             direction=divergence_data.signal_direction,
         )
         
-        # Primary check: Is divergence actionable?
-        if not divergence_data.is_actionable:
+        # Primary check: Is divergence actionable? (use asset-specific threshold)
+        is_actionable = (
+            divergence_data.divergence >= min_divergence and
+            divergence_data.pm_orderbook_age_seconds <= settings.signals.max_pm_staleness_seconds
+        )
+        
+        # Override: High divergence (>30%) always actionable
+        if divergence_data.divergence >= settings.signals.high_divergence_override_pct:
+            is_actionable = True
+        
+        if not is_actionable:
             # Log why not actionable (INFO level to help debug)
-            if divergence_data.divergence < settings.signals.min_divergence_pct:
+            if divergence_data.divergence < min_divergence:
                 self._track_rejection(
                     "divergence_low", divergence_data.divergence, divergence_data.pm_orderbook_age_seconds,
                     divergence_data.signal_direction, consensus, pm_data
@@ -473,8 +514,9 @@ class SignalDetector:
                 if divergence_data.divergence > 0.03:  # 3%+ worth logging
                     self.logger.info(
                         "⏸️ Divergence below threshold",
+                        asset=asset,
                         divergence=f"{divergence_data.divergence:.1%}",
-                        required=f"{settings.signals.min_divergence_pct:.1%}",
+                        required=f"{min_divergence:.1%}",
                         direction=divergence_data.signal_direction,
                     )
             elif divergence_data.pm_orderbook_age_seconds > settings.signals.max_pm_staleness_seconds:
@@ -499,9 +541,9 @@ class SignalDetector:
             self.logger.debug("Duplicate signal suppressed", direction=direction.value)
             return None
         
-        # Check supporting conditions
+        # Check supporting conditions (with asset-specific thresholds)
         passed, rejection = self._check_supporting_conditions(
-            consensus, pm_data, divergence_data
+            consensus, pm_data, divergence_data, asset
         )
         
         if not passed:

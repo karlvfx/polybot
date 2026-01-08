@@ -329,8 +329,8 @@ class TradingBot:
         # NOTE: Oracle is optional for divergence strategy (spot-PM divergence is primary signal)
         # We'll still pass it if available for logging/metrics
         
-        # Detect signal
-        signal = self.signal_detector.detect(consensus, oracle, pm_data)
+        # Detect signal (pass asset for asset-specific thresholds)
+        signal = self.signal_detector.detect(consensus, oracle, pm_data, asset=asset)
         if not signal:
             return
         

@@ -4,7 +4,7 @@ Uses pydantic-settings for validation and environment variable loading.
 """
 
 from enum import Enum
-from typing import Optional
+from typing import Dict, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -214,6 +214,67 @@ class RiskSettings(BaseSettings):
     night_mode_end_hour: int = 6  # 06:00
 
 
+class AssetSpecificSettings(BaseSettings):
+    """
+    Per-asset configuration overrides.
+    
+    Different assets have different characteristics:
+    - BTC: Higher liquidity on PM, tighter spreads
+    - ETH: Medium liquidity
+    - SOL: Lower liquidity, wider spreads
+    
+    These settings override the defaults in SignalSettings for specific assets.
+    """
+    
+    # Minimum liquidity to trade (EUR)
+    min_liquidity_eur: Optional[float] = None
+    
+    # Minimum divergence to trigger signal (decimal, e.g., 0.05 = 5%)
+    min_divergence_pct: Optional[float] = None
+    
+    # Confidence threshold for alerts
+    alert_confidence_threshold: Optional[float] = None
+    
+    # Price range to trade (avoid extreme favorites/underdogs)
+    min_price: Optional[float] = None  # e.g., 0.10 = 10¢
+    max_price: Optional[float] = None  # e.g., 0.90 = 90¢
+
+
+class AssetConfigs(BaseSettings):
+    """
+    Container for all asset-specific configurations.
+    
+    Usage in .env:
+        ASSET_BTC__MIN_LIQUIDITY_EUR=100
+        ASSET_ETH__MIN_DIVERGENCE_PCT=0.08
+    """
+    
+    BTC: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
+        min_liquidity_eur=50.0,  # Higher liquidity available
+        min_divergence_pct=0.05,  # 5%
+        min_price=0.05,
+        max_price=0.95,
+    ))
+    
+    ETH: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
+        min_liquidity_eur=40.0,  # Medium liquidity
+        min_divergence_pct=0.06,  # 6% - slightly higher threshold
+        min_price=0.08,
+        max_price=0.92,
+    ))
+    
+    SOL: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
+        min_liquidity_eur=30.0,  # Lower liquidity typical
+        min_divergence_pct=0.08,  # 8% - need bigger edge
+        min_price=0.10,
+        max_price=0.90,
+    ))
+    
+    def get(self, asset: str) -> AssetSpecificSettings:
+        """Get settings for a specific asset, with defaults."""
+        return getattr(self, asset.upper(), AssetSpecificSettings())
+
+
 class AlertSettings(BaseSettings):
     """Discord alerting settings."""
     
@@ -258,6 +319,7 @@ class Settings(BaseSettings):
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     alerts: AlertSettings = Field(default_factory=AlertSettings)
+    asset_configs: AssetConfigs = Field(default_factory=AssetConfigs)
     
     # Feed health
     heartbeat_interval_seconds: float = 2.0
