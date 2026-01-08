@@ -155,10 +155,10 @@ class ConfidenceWeights(BaseSettings):
     
     # Supporting factors (30% total) - simplified
     consensus_strength_weight: float = 0.15  # Exchange agreement - was 0.12
-    liquidity_weight: float = 0.15           # Liquidity depth - was 0.08
+    liquidity_weight: float = 0.10           # Liquidity depth (adjusted for volume surge)
     
     # DISABLED: These filters are broken (always return 0)
-    volume_surge_weight: float = 0.0     # BROKEN - always <1.0x
+    volume_surge_weight: float = 0.05    # FIXED - now uses Z-score
     spike_concentration_weight: float = 0.0  # BROKEN - always 0%
     
     # Fee-aware scoring (0%) - reduce noise for now

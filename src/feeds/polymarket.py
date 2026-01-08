@@ -783,6 +783,14 @@ class PolymarketFeed:
         self._last_price_change_ms: int = 0  # When any price last changed
         self._last_data_received_ms: int = 0  # When we last received ANY orderbook update
         
+        # NEW: Depth tracking for orderbook freeze detection
+        # "Freeze" = prices static but depth changing = MM about to reprice
+        self._last_yes_depth: float = 0.0
+        self._last_no_depth: float = 0.0
+        self._freeze_window_start_ms: int = 0  # When price freeze started
+        self._depth_at_freeze_start_yes: float = 0.0
+        self._depth_at_freeze_start_no: float = 0.0
+        
         # NEW: Fee tracking (Jan 2026 Polymarket fee update)
         self._yes_fee_rate_bps: int = 0
         self._no_fee_rate_bps: int = 0
@@ -1102,12 +1110,45 @@ class PolymarketFeed:
             abs(no_ask - self._last_no_ask) > 0.001
         )
         
+        # ====================================================================
+        # NEW: Orderbook freeze detection
+        # Freeze = prices static but depth changing by >10%
+        # This indicates MMs are repositioning but haven't repriced yet
+        # ====================================================================
+        orderbook_freeze_detected = False
+        depth_change_pct = 0.0
+        
         if price_changed or self._last_price_change_ms == 0:
+            # Prices changed - reset freeze tracking
             self._last_price_change_ms = now_ms
             self._last_yes_bid = yes_bid
             self._last_yes_ask = yes_ask
             self._last_no_bid = no_bid
             self._last_no_ask = no_ask
+            # Reset freeze window
+            self._freeze_window_start_ms = now_ms
+            self._depth_at_freeze_start_yes = yes_depth_total
+            self._depth_at_freeze_start_no = no_depth_total
+        else:
+            # Prices are static - check if depth is changing
+            freeze_duration_ms = now_ms - self._freeze_window_start_ms
+            
+            # Only check freeze after 3+ seconds of static prices
+            if freeze_duration_ms >= 3000:
+                # Calculate depth change since freeze started
+                depth_start = self._depth_at_freeze_start_yes + self._depth_at_freeze_start_no
+                depth_now = yes_depth_total + no_depth_total
+                
+                if depth_start > 0:
+                    depth_change_pct = abs(depth_now - depth_start) / depth_start
+                    
+                    # Freeze detected if depth changed >10% while prices static
+                    if depth_change_pct > 0.10:
+                        orderbook_freeze_detected = True
+        
+        # Track current depth for next comparison
+        self._last_yes_depth = yes_depth_total
+        self._last_no_depth = no_depth_total
         
         # Track when we received data (for connection health check)
         self._last_data_received_ms = now_ms
@@ -1115,6 +1156,7 @@ class PolymarketFeed:
         # Calculate orderbook age (seconds since last price change)
         # This is for divergence strategy - stale prices = opportunity
         orderbook_age_seconds = (now_ms - self._last_price_change_ms) / 1000.0
+        data_age_seconds = 0.0  # This is calculated at get_data() time
         
         self._last_snapshot_ms = now_ms
         
@@ -1140,6 +1182,10 @@ class PolymarketFeed:
             # Staleness tracking for divergence strategy
             last_price_change_ms=self._last_price_change_ms,
             orderbook_age_seconds=orderbook_age_seconds,
+            data_age_seconds=data_age_seconds,
+            # Freeze detection (prices static but depth changing)
+            orderbook_freeze_detected=orderbook_freeze_detected,
+            depth_change_pct=depth_change_pct,
             # Fee tracking (Jan 2026 update)
             yes_token_id=self._yes_token_id or "",
             no_token_id=self._no_token_id or "",

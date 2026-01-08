@@ -3,8 +3,10 @@ Consensus Engine for multi-exchange price aggregation.
 Implements weighted averaging with outlier rejection.
 """
 
+import math
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 from statistics import median
 
@@ -41,6 +43,64 @@ class ATRHistory:
         return sorted_vals[min(idx, len(sorted_vals) - 1)]
 
 
+@dataclass
+class VolumeZScoreTracker:
+    """
+    Tracks volume history for Z-score calculation.
+    
+    Z-score = (current - mean) / std_dev
+    A Z-score > 2.0 indicates statistically significant volume surge.
+    """
+    history: deque = field(default_factory=lambda: deque(maxlen=300))  # 5 min at 1/sec
+    
+    def add(self, volume: float) -> None:
+        """Add a volume observation."""
+        self.history.append(volume)
+    
+    def get_zscore(self, current_volume: float) -> float:
+        """
+        Calculate Z-score for current volume.
+        
+        Returns:
+            Z-score: positive = above average, negative = below
+            Returns 0.0 if insufficient history (<30 samples)
+        """
+        if len(self.history) < 30:  # Need at least 30 samples for reliable stats
+            return 0.0
+        
+        # Calculate mean and std dev
+        values = list(self.history)
+        mean = sum(values) / len(values)
+        
+        if mean == 0:
+            return 0.0
+        
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        std_dev = math.sqrt(variance)
+        
+        if std_dev == 0:
+            return 0.0
+        
+        return (current_volume - mean) / std_dev
+    
+    def get_surge_ratio(self, current_volume: float) -> float:
+        """
+        Convert Z-score to a surge ratio for compatibility.
+        
+        Z-score 0 = 1.0x (baseline)
+        Z-score 2 = 2.5x (significant surge)
+        Z-score 3+ = 3.5x+ (extreme surge)
+        """
+        zscore = self.get_zscore(current_volume)
+        
+        if zscore <= 0:
+            return 1.0  # At or below average
+        
+        # Map Z-score to surge ratio: zscore * 0.75 + 1.0
+        # Z=2 -> 2.5x, Z=3 -> 3.25x
+        return 1.0 + (zscore * 0.75)
+
+
 class ConsensusEngine:
     """
     Aggregates price data from multiple exchanges to form consensus.
@@ -62,9 +122,9 @@ class ConsensusEngine:
         # Historical ATR for percentile calculation
         self._atr_history = ATRHistory(values=[])
         
-        # Volume history for surge detection
-        self._volume_history: list[tuple[int, float]] = []  # (timestamp_ms, volume)
-        self._volume_history_max_age_ms = 300_000  # 5 minutes
+        # Volume tracking - NEW: Z-score based surge detection
+        self._volume_zscore_tracker = VolumeZScoreTracker()
+        self._last_volume_update_ms: int = 0
         
         # Current consensus
         self._current_consensus: Optional[ConsensusData] = None
@@ -144,25 +204,13 @@ class ConsensusEngine:
         
         return None
     
-    def _update_volume_history(self, total_volume: float) -> None:
-        """Update rolling volume history."""
-        now_ms = int(time.time() * 1000)
-        self._volume_history.append((now_ms, total_volume))
-        
-        # Cleanup old entries
-        cutoff = now_ms - self._volume_history_max_age_ms
-        self._volume_history = [
-            (ts, vol) for ts, vol in self._volume_history if ts > cutoff
-        ]
-    
-    def _get_avg_volume_5m(self) -> float:
-        """Get average volume over last 5 minutes."""
-        if len(self._volume_history) < 2:
+    def get_volume_zscore(self) -> float:
+        """Get current volume Z-score (for logging/debugging)."""
+        if not self._current_consensus:
             return 0.0
-        
-        # Group by minute and average
-        volumes = [vol for _, vol in self._volume_history]
-        return sum(volumes) / len(volumes) if volumes else 0.0
+        return self._volume_zscore_tracker.get_zscore(
+            self._current_consensus.total_volume_1m
+        )
     
     def _determine_volatility_regime(self, atr: float) -> VolatilityRegime:
         """Determine current volatility regime based on ATR percentile."""
@@ -246,19 +294,21 @@ class ConsensusEngine:
         # Calculate spike concentration
         spike_concentration = max_10s_move / abs(move_30s) if move_30s != 0 else 0.0
         
-        # Volume metrics - use exchange-level averages for better accuracy
+        # Volume metrics - FIXED: Use Z-score for proper surge detection
         total_volume = sum(m.volume_1m for m in fresh_metrics)
         
-        # Get average from exchange-level 5-minute averages
-        exchange_avg_volumes = [m.volume_5m_avg for m in fresh_metrics if m.volume_5m_avg > 0]
-        if exchange_avg_volumes:
-            avg_volume_5m = sum(exchange_avg_volumes)
-        else:
-            # Fallback to internal history tracking
-            self._update_volume_history(total_volume)
-            avg_volume_5m = self._get_avg_volume_5m()
+        # Update Z-score tracker (once per second max)
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_volume_update_ms >= 1000:
+            self._volume_zscore_tracker.add(total_volume)
+            self._last_volume_update_ms = now_ms
         
-        volume_surge = total_volume / avg_volume_5m if avg_volume_5m > 0 else 1.0
+        # Calculate surge ratio from Z-score
+        # Z-score > 2.0 = significant surge (mapped to ~2.5x ratio)
+        volume_surge = self._volume_zscore_tracker.get_surge_ratio(total_volume)
+        
+        # Get average volume for reporting
+        avg_volume_5m = sum(self._volume_zscore_tracker.history) / max(len(self._volume_zscore_tracker.history), 1)
         
         # Determine volatility regime
         vol_regime = self._determine_volatility_regime(atr_5m)
@@ -313,6 +363,8 @@ class ConsensusEngine:
             "move_30s_pct": self._current_consensus.move_30s_pct if self._current_consensus else None,
             "volatility_regime": self._current_consensus.volatility_regime.value if self._current_consensus else None,
             "volume_surge_ratio": self._current_consensus.volume_surge_ratio if self._current_consensus else None,
+            "volume_zscore": self.get_volume_zscore(),
+            "volume_history_size": len(self._volume_zscore_tracker.history),
             "atr_history_size": len(self._atr_history.values),
         }
 

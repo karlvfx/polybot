@@ -204,6 +204,11 @@ class PolymarketData:
     # NEW: Orderbook staleness tracking (for divergence strategy)
     last_price_change_ms: int = 0  # When YES/NO prices last changed
     orderbook_age_seconds: float = 0.0  # Seconds since last price change
+    data_age_seconds: float = 0.0  # Seconds since last data received (connection health)
+    
+    # NEW: Orderbook freeze detection (prices static but depth changing = MM about to reprice)
+    orderbook_freeze_detected: bool = False  # Prices static but depth changed >10%
+    depth_change_pct: float = 0.0  # How much depth changed while prices static
     
     # NEW: Fee tracking (Polymarket fee update Jan 2026)
     yes_token_id: str = ""

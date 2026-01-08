@@ -81,6 +81,11 @@ class ConfidenceScorer:
         a different probability than what PM is showing.
         
         Higher divergence = higher score.
+        
+        FIXED: Widened scoring range so typical divergences (5-10%) score well.
+        - 5% divergence = 0.0 (minimum threshold)
+        - 8% divergence = 0.6 (good score)
+        - 10% divergence = 1.0 (perfect score)
         """
         # Calculate spot-implied probability
         spot_implied = calculate_spot_implied_prob(
@@ -91,10 +96,11 @@ class ConfidenceScorer:
         # Calculate divergence
         divergence = abs(spot_implied - pm_yes_price)
         
-        # Normalize: 15% divergence = perfect score
-        # Anything below min_divergence gets 0
-        min_div = settings.signals.min_divergence_pct
-        max_div = 0.15
+        # FIXED: Widened scoring range
+        # min_div (5%) = 0.0 score
+        # max_div (10%) = 1.0 score (was 15% - too strict!)
+        min_div = settings.signals.min_divergence_pct  # 0.05 (5%)
+        max_div = 0.10  # 10% divergence = perfect score (was 0.15)
         
         if divergence < min_div:
             return 0.0
@@ -217,6 +223,38 @@ class ConfidenceScorer:
         
         return 0.0  # Neutral OBI = no bonus
     
+    def _score_freeze_bonus(
+        self,
+        freeze_detected: bool,
+        depth_change_pct: float,
+    ) -> float:
+        """
+        Calculate orderbook freeze confidence bonus.
+        
+        "Freeze" = prices static but depth changing = MM repositioning
+        This is a high-quality signal that repricing is imminent.
+        
+        Args:
+            freeze_detected: Whether freeze pattern was detected
+            depth_change_pct: How much depth changed while prices static
+            
+        Returns:
+            0.0 to 0.15 (up to +15% confidence bonus)
+        """
+        if not freeze_detected:
+            return 0.0
+        
+        # More depth change = higher confidence
+        # 10% change = +5%, 20% change = +10%, 30%+ = +15%
+        if depth_change_pct >= 0.30:
+            return 0.15
+        elif depth_change_pct >= 0.20:
+            return 0.10
+        elif depth_change_pct >= 0.10:
+            return 0.05
+        
+        return 0.0
+    
     def _score_maker_advantage(
         self,
         pm_data,  # PolymarketData
@@ -329,8 +367,8 @@ class ConfidenceScorer:
             pm.liquidity_30s_ago,
         )
         
-        # Volume surge score - DISABLED (calculation broken, always <1.0x)
-        volume_score = 0.0  # self._score_volume_surge(consensus.volume_surge_ratio)
+        # Volume surge score - FIXED: Now uses Z-score calculation
+        volume_score = self._score_volume_surge(consensus.volume_surge_ratio)
         
         # Spike concentration score - DISABLED (always returns 0%)
         spike_score = 0.0  # self._score_spike_concentration(consensus.spike_concentration)
@@ -343,6 +381,13 @@ class ConfidenceScorer:
         obi_bonus = self._score_obi_bonus(
             pm.orderbook_imbalance_ratio,
             signal.direction.value if signal.direction else "UP",
+        )
+        
+        # NEW: Orderbook freeze bonus - up to +15% confidence
+        # Freeze = prices static but depth changing = MM about to reprice
+        freeze_bonus = self._score_freeze_bonus(
+            pm.orderbook_freeze_detected,
+            pm.depth_change_pct,
         )
         
         # Create breakdown
@@ -370,6 +415,9 @@ class ConfidenceScorer:
         # Add OBI bonus (up to +10% confidence when OBI confirms direction)
         confidence += obi_bonus
         
+        # Add freeze bonus (up to +15% when orderbook freeze detected)
+        confidence += freeze_bonus
+        
         # Log if OBI boost applied
         if obi_bonus > 0.01:
             self.logger.debug(
@@ -377,6 +425,14 @@ class ConfidenceScorer:
                 obi_ratio=f"{pm.orderbook_imbalance_ratio:+.2f}",
                 direction=signal.direction.value if signal.direction else "N/A",
                 boost=f"+{obi_bonus:.1%}",
+            )
+        
+        # Log if freeze boost applied
+        if freeze_bonus > 0.01:
+            self.logger.info(
+                "🧊 Orderbook freeze detected - confidence boost applied",
+                depth_change=f"{pm.depth_change_pct:.1%}",
+                boost=f"+{freeze_bonus:.1%}",
             )
         
         # Apply probability normalization penalty (if YES + NO != 1.0)
