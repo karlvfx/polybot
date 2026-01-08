@@ -201,7 +201,7 @@ class RiskSettings(BaseSettings):
     starting_capital_eur: float = 500.0
     max_position_pct: float = 0.005  # 0.5% of bankroll
     max_daily_exposure_pct: float = 0.05  # 5% of bankroll
-    max_concurrent_positions: int = 1
+    max_concurrent_positions: int = 3  # One per asset (BTC, ETH, SOL)
     
     # Circuit breakers
     daily_loss_limit_eur: float = 40.0
