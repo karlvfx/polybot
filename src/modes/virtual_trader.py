@@ -266,9 +266,22 @@ class VirtualTrader:
             )
             return None  # Return None instead of broken position
         
-        # NOTE: Extreme price filter removed - dynamic stop loss handles risk
-        # At $0.02, if divergence is 47%, that's a huge opportunity
-        # The dynamic stop loss (allows $0.03 move) provides protection
+        # EXTREME PRICE FILTER: Avoid very low/high priced entries
+        # At $0.02, a move to $0.01 = -50% loss in 1 second (ungappable)
+        # At $0.98, a move to $0.99 = +1% gain max (no upside)
+        # Safe zone: $0.10 - $0.90 (10% - 90% odds)
+        MIN_SAFE_PRICE = 0.10
+        MAX_SAFE_PRICE = 0.90
+        
+        if entry_price < MIN_SAFE_PRICE or entry_price > MAX_SAFE_PRICE:
+            self.logger.info(
+                "⚠️ Extreme price - skipping position",
+                side=side,
+                entry_price=f"${entry_price:.3f}",
+                safe_range=f"${MIN_SAFE_PRICE:.2f}-${MAX_SAFE_PRICE:.2f}",
+                reason="Price too extreme - gap risk too high",
+            )
+            return None
         
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
@@ -400,7 +413,7 @@ class VirtualTrader:
                     await self._close_virtual_position(position, exit_reason)
                     break
                 
-                await asyncio.sleep(1)  # Check every second
+                await asyncio.sleep(0.5)  # Check every 500ms (was 1s)
                 
             except asyncio.CancelledError:
                 self.logger.info("Position monitoring cancelled", position_id=position.position_id)

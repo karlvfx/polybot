@@ -130,8 +130,8 @@ class SignalSettings(BaseSettings):
     max_volatility_30s: float = 0.008  # 0.8% - slightly higher tolerance
     
     # Consensus / Exchange Agreement
-    consensus_price_tolerance: float = 0.0015  # 0.15% max deviation
-    min_agreement_score: float = 0.80  # 80% agreement quality required (lowered)
+    consensus_price_tolerance: float = 0.0020  # 0.20% max deviation (was 0.15%)
+    min_agreement_score: float = 0.70  # 70% agreement - was 80% causing 1768 rejections!
     
     # Mispricing detection (legacy - kept for backward compat)
     min_mispricing_pct: float = 0.03  # 3% mispricing required
