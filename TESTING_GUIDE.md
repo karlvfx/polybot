@@ -1,181 +1,262 @@
-# Testing Guide - Critical Improvements
+# Polybot Optimization Plan - Synthesized from Expert Analysis
 
-## ✅ Validation Results
+**Last Updated:** January 8, 2026
 
-All 11 critical improvements have been validated:
+This plan synthesizes recommendations from 3 different AI expert analyses, resolving conflicts and prioritizing by impact.
 
-1. ✓ Volume tracking with 5-minute rolling average
-2. ✓ Exchange agreement scoring (0-1 scale)
-3. ✓ Volume authentication (surge detection)
-4. ✓ Spike concentration (anti-drift filter)
-5. ✓ Liquidity collapse detection
-6. ✓ Escape clause for sub-threshold moves
-7. ✓ Enhanced configuration settings
-8. ✓ Comprehensive logging
+---
 
-## 🧪 Quick Validation
+## 🔬 Expert Consensus
 
-Run the validation script to verify all improvements:
+All 3 models agreed on these key points:
 
-```bash
-python3 validate_improvements.py
-```
+| Topic | Consensus |
+|-------|-----------|
+| **#1 Priority** | Maker strategy (not signals, not infra) |
+| **Fee Impact** | Taker fees (up to 3%) are destroying profits |
+| **Testing First** | Shadow/paper test before real capital |
+| **Your Wins** | Z-score, freeze detection, per-asset configs = excellent |
 
-## 🚀 Running in Shadow Mode
+---
 
-### Prerequisites
+## ⚔️ Conflict Resolution
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+| Topic | Model 1 | Model 2 | Model 3 | **Winner** |
+|-------|---------|---------|---------|------------|
+| **Wait time** | 10-15s | Not specified | **3.5s max** | 🏆 Model 3 |
+| **Pricing** | 1-2% inside spread | Not specified | **Spread-relative (tick)** | 🏆 Model 3 |
+| **Dual-region** | Priority | €4/mo forwarder | **Delay it** | 🏆 Model 3 |
+| **Stale filter** | - | 15-20s | - | Consider tightening |
 
-2. Create `.env` file with minimal configuration:
-```env
-# Operating Mode
-MODE=shadow
+---
 
-# Polygon RPC (for Chainlink oracle)
-CHAINLINK__POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
+## 🎯 The Action Plan
 
-# Optional: Discord alerts
-ALERTS__DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+### PHASE A: Maker Shadow Mode (Day 1-2)
+*Test the strategy without risking capital*
 
-# Optional: Polymarket market IDs (if you have them)
-POLYMARKET__BTC_UP_MARKET_ID=...
-POLYMARKET__BTC_DOWN_MARKET_ID=...
-```
-
-### Start the Bot
-
-```bash
-python3 -m src.main
-```
-
-The bot will:
-- Connect to Binance, Coinbase, and Kraken WebSocket feeds
-- Monitor Chainlink oracle on Polygon
-- Monitor Polymarket orderbooks (if market IDs configured)
-- Detect signals with the new multi-layer validation
-- Log all signals to `logs/signals_YYYY-MM-DD.jsonl`
-
-### What to Monitor
-
-1. **Signal Quality**: Check logs for rejection reasons
-   - Most rejections should be due to volume/surge filters
-   - Spike concentration should filter out smooth drifts
-   - Agreement score should ensure consensus quality
-
-2. **Signal Density**: Target 5-15 signals per day
-   - Too many = thresholds too low
-   - Too few = thresholds too high
-
-3. **Win Rate**: Target ≥65% in shadow mode
-   - Track in shadow mode performance report
-   - Review after 50+ signals
-
-4. **Filter Effectiveness**: Check rejection reasons
-   ```bash
-   # Count rejection reasons
-   grep -o '"reason":"[^"]*"' logs/signals_*.jsonl | sort | uniq -c
-   ```
-
-## 📊 Key Metrics to Track
-
-### Volume Surge
-- Should see 2x+ volume surge on valid signals
-- Rejections with `VOLUME_LOW` indicate filter working
-
-### Spike Concentration
-- Valid signals: 60%+ of move in 10s window
-- Rejections with `SMOOTH_DRIFT` indicate filter working
-
-### Agreement Score
-- Valid signals: ≥0.85 agreement score
-- Rejections with `CONSENSUS_FAILURE` may indicate low agreement
-
-### Oracle Timing
-- Low vol regime: 12-75s window
-- Normal vol regime: 6-75s window
-- Rejections with `ORACLE_TOO_FRESH` or `ORACLE_TOO_STALE` indicate timing filter
-
-### Liquidity Collapse
-- Rejections with `LIQUIDITY_COLLAPSING` indicate protection working
-- Check logs for liquidity drop percentages
-
-## 🔍 Analyzing Logs
-
-### View Recent Signals
-```bash
-tail -f logs/signals_$(date +%Y-%m-%d).jsonl | jq .
-```
-
-### Count Signals by Type
-```bash
-jq -r '.signal_type' logs/signals_*.jsonl | sort | uniq -c
-```
-
-### Analyze Volume Surge Distribution
-```bash
-jq -r '.spot_data.volume_surge_ratio' logs/signals_*.jsonl | \
-  awk '{sum+=$1; count++} END {print "Avg:", sum/count}'
-```
-
-### Check Agreement Scores
-```bash
-jq -r '.spot_data.agreement_score' logs/signals_*.jsonl | \
-  awk '{sum+=$1; count++} END {print "Avg:", sum/count}'
-```
-
-## ⚙️ Tuning Thresholds
-
-If signals are too frequent/rare, adjust in `config/settings.py`:
+**Goal:** Validate fill rates before committing real money
 
 ```python
-class SignalSettings:
-    # Volume surge threshold (default: 2.0)
-    volume_surge_threshold: float = 2.0  # Increase to reduce signals
+# Shadow Maker Logic
+async def shadow_maker_test(signal):
+    """Log what WOULD happen with a maker order"""
     
-    # Spike concentration (default: 0.60)
-    spike_concentration_threshold: float = 0.60  # Increase to reduce signals
+    # 1. Calculate maker price (spread-relative, not %)
+    best_bid, best_ask = get_pm_spread(signal.token_id)
+    tick = 0.01  # Polymarket tick size
+    maker_price = best_ask - tick  # Step inside spread minimally
     
-    # Agreement score (default: 0.85)
-    min_agreement_score: float = 0.85  # Increase to reduce signals
+    # 2. Log the hypothetical order
+    log_entry = {
+        "time": time.time(),
+        "token_id": signal.token_id,
+        "maker_price": maker_price,
+        "direction": signal.direction,
+        "divergence": signal.divergence,
+    }
+    
+    # 3. Watch PM WebSocket for 3.5s (fast timeout)
+    filled = await check_if_price_hit(maker_price, timeout=3.5)
+    
+    log_entry["would_have_filled"] = filled
+    log_entry["time_to_fill"] = filled_time if filled else None
+    
+    save_shadow_log(log_entry)
 ```
 
-## 🎯 Success Criteria
+**Success Metric:** Need **>40% fill rate** to proceed
 
-After 2-4 weeks of shadow mode:
+---
 
-- [ ] 100+ signals logged
-- [ ] Win rate ≥ 65%
-- [ ] Avg profit ≥ €1.50/trade (after gas)
-- [ ] Signal density: 5-15/day
-- [ ] E2E latency < 200ms consistently
+### PHASE B: Real Maker Implementation (Day 3-5)
+*After shadow testing proves viability*
 
-## 🐛 Troubleshooting
+**Critical Implementation Details:**
 
-### No Signals Generated
-- Check feed connections (should see "Connected" logs)
-- Verify oracle age is in valid window
-- Check if all filters are too strict
+```python
+# CORRECT Maker Order Placement
+async def place_maker_order(token_id, signal):
+    best_bid, best_ask = get_pm_spread(token_id)
+    tick = 0.01
+    
+    # Step inside spread, but barely (spread-relative)
+    maker_price = min(best_ask - tick, signal.target_price)
+    
+order = client.create_and_post_order(
+    OrderArgs(
+        token_id=token_id,
+        price=maker_price,
+        size=100,
+        side=BUY,
+    ),
+    OrderType.GTC,
+        post_only=True  # CRITICAL: Fail rather than become taker
+    )
+    
+    # Pseudo-IOC behavior with 3.5s timeout (NOT 15s!)
+    MAKER_TIMEOUT = 3.5  # seconds
+    
+    done, pending = await asyncio.wait(
+        [
+            wait_for_fill(order['orderID']),
+            asyncio.sleep(MAKER_TIMEOUT),
+            wait_for_divergence_collapse(signal),  # Cancel if edge gone
+        ],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    
+    # Cancel immediately if not filled
+    if not is_filled(order['orderID']):
+        await client.cancel(order['orderID'])
+        # DON'T fallback to taker - just miss the trade
+        return None
+    
+    return order
+```
 
-### Too Many Rejections
-- Review rejection reasons in logs
-- May need to adjust thresholds
-- Check if market conditions are unusual
+**Key Points:**
+- `post_only=True` prevents accidental taker orders (and 3% fees)
+- 3.5s timeout, NOT 10-15s (edge is gone by then)
+- Cancel if divergence collapses (don't sit on stale orders)
+- Don't fallback to taker - missed maker trade is better than paying fees
 
-### Feed Connection Issues
-- Verify WebSocket URLs are correct
-- Check network connectivity
-- Review feed health logs
+---
 
-## 📝 Next Steps
+### PHASE C: Refinements (Week 2)
 
-1. Run in shadow mode for 2-4 weeks
-2. Collect 100+ signals
-3. Analyze win rate and profit metrics
-4. Tune thresholds based on data
-5. Move to alert mode for manual review
-6. Finally, enable night_auto mode if criteria met
+#### C.1 MM Pullback Detector
+Detect when MMs are about to reprice:
 
+```python
+# Cancel burst detection
+if cancels_per_second > threshold and price_static:
+    repricing_imminent = True
+    # Use smaller size, faster cancel
+```
+
+#### C.2 Time-to-Close Multiplier
+Near close = faster MM repricing = better fills:
+
+```python
+if time_to_close < 180:  # 3 minutes to market close
+    confidence *= 1.15
+```
+
+#### C.3 Tighten Stale Filter
+Change from 60s to 20s for ghost liquidity detection:
+
+```python
+STALE_BOOK_THRESHOLD = 20  # was 60
+```
+
+---
+
+### PHASE D: Optional Enhancements (Month 2+)
+
+| Item | Priority | Cost | Notes |
+|------|----------|------|-------|
+| Pyth Network | Low | Free | Adds redundancy, 1 hour setup |
+| Binance Forwarder | Low | €4/mo | EU VPS → UDP to US, only if needed |
+| Dual-region mesh | Low | $10/mo | Delay until connection issues return |
+
+---
+
+## 📊 Metrics to Track
+
+### OLD (Wrong Focus)
+- ❌ Win rate (targeting 60%)
+
+### NEW (Correct Focus)
+- ✅ **EV per trade** = (avg_win × win_rate) - (avg_loss × loss_rate)
+- ✅ **Maker capture rate** = maker_fills / (maker_fills + missed)
+- ✅ **Time to fill** distribution
+- ✅ **Fee savings** = taker_fees_avoided per day
+
+**Why EV matters more than win rate:**
+With maker rebates, you can be profitable at 45% win rate. What matters is:
+- Avg win size (bigger with maker pricing)
+- Fee drag (eliminated with maker)
+- Trade quality (better entries)
+
+---
+
+## ⚡ Immediate Actions Checklist
+
+### Today
+- [ ] Enable ETH, SOL on VPS: `ASSETS=BTC,ETH,SOL`
+- [ ] Pull latest code: `git pull && sudo systemctl restart polybot`
+- [ ] Monitor virtual trades for 4+ hours
+
+### Day 2
+- [ ] Implement shadow maker logging
+- [ ] Collect 50+ shadow samples
+
+### Day 3
+- [ ] Analyze shadow logs
+- [ ] If fill rate >40% → proceed to real maker
+
+### Day 4-5
+- [ ] Implement py-clob-client integration
+- [ ] Test maker orders in shadow mode
+- [ ] Verify `post_only` prevents taker fills
+
+### Week 2
+- [ ] Add cancel burst detection
+- [ ] Add time-to-close multiplier
+- [ ] Tighten stale book filter to 20s
+
+---
+
+## 🔧 Technical Requirements
+
+### py-clob-client Installation
+```bash
+pip install py-clob-client
+```
+
+### Required for Maker Orders
+- Polygon wallet with private key
+- Small amount of MATIC for gas (~$1)
+- USDC balance for trading
+
+### Order Signing Note
+EIP-712 signing can take 200-800ms in Python. Mitigate by:
+- Pre-calculating order structures where possible
+- Running signing in separate worker if needed
+
+---
+
+## 📈 Expected Results
+
+### Current State (Taker Mode)
+- Fees: 1.6-3% per trade
+- Profit per €20 trade: ~€0.30
+- Break-even win rate: ~55%
+
+### After Maker Strategy
+- Fees: 0% (+ rebates!)
+- Profit per €20 trade: ~€1.50+
+- Break-even win rate: ~40%
+- **5x profit improvement**
+
+---
+
+## ⚠️ Risk Management
+
+1. **Never chase fills** - If maker doesn't fill in 3.5s, let it go
+2. **post_only is mandatory** - One accidental taker = wipes out 5 maker rebates
+3. **Shadow test first** - Don't risk capital until fill rate proven
+4. **Start small** - €10-20 positions until strategy validated
+
+---
+
+## 📚 References
+
+- [py-clob-client GitHub](https://github.com/Polymarket/py-clob-client)
+- [Polymarket Order API Docs](https://docs.polymarket.com/developers/CLOB/orders/create-order)
+- [CLOB Introduction](https://docs.polymarket.com/developers/CLOB/introduction)
+
+---
+
+**Next Step:** Switch to Agent mode to implement Shadow Maker testing.
