@@ -4,6 +4,7 @@ Provides common functionality for all data feeds.
 """
 
 import asyncio
+import random
 import ssl
 import time
 from abc import ABC, abstractmethod
@@ -290,16 +291,19 @@ class BaseFeed(ABC):
             if self.ws_url.startswith('wss://'):
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
             
-            # Connection timeout (10s) - balance between fast and reliable
+            # Connection timeout (15s) - balance between fast and reliable
+            # Add slight randomization to ping interval to spread load
+            ping_interval = 25 + random.randint(0, 10)  # 25-35s
+            
             self._ws = await asyncio.wait_for(
                 websockets.connect(
                     self.ws_url,
-                    ping_interval=30,  # Less frequent pings
-                    ping_timeout=20,   # More time to respond
+                    ping_interval=ping_interval,
+                    ping_timeout=25,   # More time to respond
                     close_timeout=5,
                     ssl=ssl_context,
                 ),
-                timeout=10.0  # 10s for VPS connections
+                timeout=15.0  # 15s for VPS connections
             )
             self.health.connected = True
             self.logger.info("Connected to WebSocket")
@@ -324,7 +328,7 @@ class BaseFeed(ABC):
             return False
     
     async def _reconnect(self) -> None:
-        """Handle reconnection with exponential backoff."""
+        """Handle reconnection with exponential backoff + jitter."""
         # Record disconnection event
         session_tracker.record_connection_event(
             feed_name=self.name,
@@ -334,7 +338,11 @@ class BaseFeed(ABC):
         delay = self.reconnect_delay
         while self._running:
             self.health.reconnect_count += 1
-            self.logger.info("Reconnecting", attempt=self.health.reconnect_count, delay=delay)
+            
+            # Add jitter (±30%) to prevent thundering herd
+            jittered_delay = delay * (0.7 + random.random() * 0.6)
+            
+            self.logger.info("Reconnecting", attempt=self.health.reconnect_count, delay=f"{jittered_delay:.1f}s")
             
             # Record reconnecting event
             session_tracker.record_connection_event(
@@ -344,9 +352,10 @@ class BaseFeed(ABC):
             )
             
             if await self._connect():
+                # Reset delay on successful reconnect
                 return
             
-            await asyncio.sleep(delay)
+            await asyncio.sleep(jittered_delay)
             delay = min(delay * 2, self.max_reconnect_delay)
     
     async def _receive_loop(self) -> None:
