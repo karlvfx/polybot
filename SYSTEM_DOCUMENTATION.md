@@ -796,18 +796,19 @@ class Settings(BaseSettings):
 
 | Setting | Current Value | Description |
 |---------|---------------|-------------|
-| `min_divergence_pct` | 8% | Minimum spot-PM probability divergence |
+| `min_divergence_pct` | **5%** | Minimum spot-PM probability divergence |
 | `min_pm_staleness_seconds` | 0s | PM staleness minimum (DISABLED) |
-| `max_pm_staleness_seconds` | 600s | PM staleness maximum |
-| `min_spot_move_pct` | 0.05% | Minimum price movement (lowered for testing) |
-| `volume_surge_threshold` | 0.0x | DISABLED (calculation broken) |
-| `spike_concentration_threshold` | 0% | DISABLED (calculation broken) |
-| `min_liquidity_eur` | €1 | Minimum liquidity (lowered for testing) |
-| `min_agreement_score` | 80% | Exchange agreement quality |
-| `alert_confidence_threshold` | 70% | Min confidence for alerts |
+| `max_pm_staleness_seconds` | **900s (15 min)** | PM staleness maximum (generous for quiet markets) |
+| `min_spot_move_pct` | **0.0%** | DISABLED - divergence is primary signal |
+| `volume_surge_weight` | 0.0 | DISABLED (calculation broken) |
+| `spike_concentration_weight` | 0.0 | DISABLED (calculation broken) |
+| `min_liquidity_eur` | €25 | Minimum liquidity |
+| `min_agreement_score` | **70%** | Exchange agreement quality (lowered) |
+| `consensus_price_tolerance` | **0.20%** | Max price deviation for agreement |
+| `alert_confidence_threshold` | **50%** | Min confidence for alerts (lowered) |
 | `night_mode_min_confidence` | 85% | Min confidence for auto trades |
 
-**Note**: Volume surge and spike concentration filters are currently disabled due to calculation issues. They will be fixed in a future update.
+**Note**: Volume surge and spike concentration filters are currently disabled (weight=0) due to calculation issues.
 
 ---
 
@@ -1029,10 +1030,12 @@ All components use asyncio for concurrent operations:
 
 ### Error Handling
 
-- **Connection Failures**: Automatic reconnection with exponential backoff (max 60s)
-- **Stale Data**: Filtered out after 30 seconds
+- **Connection Failures**: Automatic reconnection with exponential backoff + jitter (max 60s)
+- **WebSocket Pings**: Randomized intervals (25-35s) to spread load
+- **Stale Data**: Filtered out after 60 seconds
 - **Validation Failures**: Logged and rejected
-- **Rate Limits**: Automatic backoff for Discord
+- **Rate Limits**: Automatic backoff for Discord with rate limit detection
+- **Discord Failures**: Consecutive failure tracking, client reset on 3+ failures
 
 ### Dependencies
 
@@ -1041,6 +1044,7 @@ All components use asyncio for concurrent operations:
 pydantic>=2.0
 pydantic-settings>=2.0
 structlog>=23.0
+orjson>=3.9           # Fast JSON parsing (2-4x faster)
 
 # Async
 asyncio
@@ -1053,6 +1057,10 @@ web3>=6.0
 
 # Data
 numpy
+certifi               # SSL certificates
+
+# Performance (optional)
+# uvloop             # Disabled - causes crashes on some systems
 ```
 
 ### Project Structure
@@ -1072,7 +1080,8 @@ polybot/
 │   │   └── multi_asset.py   # Asset orchestration
 │   ├── feeds/
 │   │   ├── base.py          # Base WebSocket feed
-│   │   ├── binance.py
+│   │   ├── binance.py       # Binance spot feed
+│   │   ├── binance_futures.py  # Mark price + funding rate
 │   │   ├── coinbase.py
 │   │   ├── kraken.py
 │   │   ├── chainlink.py     # Oracle feed
@@ -1086,9 +1095,13 @@ polybot/
 │   │   └── schemas.py       # Data models
 │   └── utils/
 │       ├── alerts.py        # Discord alerter
-│       └── logging.py       # Signal logger
+│       ├── logging.py       # Signal logger
+│       ├── session_tracker.py  # Session event tracking
+│       ├── circuit_breaker.py  # Risk management
+│       └── connection_pool.py  # Pre-warmed connections
 ├── logs/                    # Signal and metrics logs
 ├── .env                     # Environment config
+├── VPS_SETUP.md             # VPS deployment guide
 └── requirements.txt
 ```
 
@@ -1122,7 +1135,7 @@ polybot/
 
 ## Roadmap
 
-### Current Status (v1.1 - January 2026)
+### Current Status (v1.2 - January 2026)
 
 ✅ Multi-asset support (BTC, ETH, SOL)  
 ✅ Virtual trading with P&L tracking  
@@ -1132,35 +1145,51 @@ polybot/
 ✅ Auto market discovery  
 ✅ VPS deployment guide  
 ✅ Signal rejection logging (INFO level)  
+✅ OBI (Orderbook Imbalance) confidence boost  
+✅ Binance Futures Mark Price feed  
+✅ Funding Rate acceleration signal  
+✅ Pre-warmed connection pools  
+✅ WebSocket reconnection with jitter  
+✅ orjson for faster JSON parsing  
 
-### Recent Changes (v1.1)
+### Recent Changes (v1.2)
 
-**Critical Fixes (Latest):**
-- **MULTI-ASSET VIRTUAL TRADING FIX**: Virtual trader now uses `signal.polymarket` (correct asset's data) instead of primary feed. Previously ETH/SOL signals failed because they tried to use BTC's PM feed.
+**New Features:**
+- **OBI CONFIDENCE BOOST**: Orderbook imbalance now provides a confidence bonus when direction aligns with imbalance
+- **BINANCE FUTURES FEED**: Mark price from Binance Futures for additional price source
+- **FUNDING RATE ACCELERATION**: Tracks funding rate changes as a sentiment signal
+- **PRE-WARMED CONNECTION POOLS**: Faster reconnection with standby connections
+- **ORJSON PARSING**: 2-4x faster JSON parsing for all feeds
+
+**Connection Stability:**
+- **WEBSOCKET JITTER**: ±30% randomization on reconnect delays (prevents thundering herd)
+- **RANDOMIZED PING INTERVALS**: 25-35s ping intervals (spreads load)
+- **DISCORD HTTP/2 DISABLED**: HTTP/2 caused issues on some VPS systems
+- **UVLOOP DISABLED**: uvloop caused core dumps on some systems
+
+**Critical Fixes:**
+- **MULTI-ASSET VIRTUAL TRADING FIX**: Virtual trader now uses `signal.polymarket` (correct asset's data) instead of primary feed
 - **HIGH DIVERGENCE OVERRIDE**: If divergence >30%, bypass all supporting filters
 - **STALE DATA FILTER**: Skip signals if PM data >5 minutes old
-- **ORACLE OPTIONAL**: Divergence strategy doesn't require oracle (spot-PM is primary signal)
-- **DYNAMIC STOP LOSS**: Uses absolute price move ($0.03) instead of fixed percentage, preventing instant stop-outs on low-priced markets
-- **EXTREME PRICE FILTER REMOVED**: No longer blocks trades at extreme odds (e.g., YES at $0.04)
+- **ORACLE OPTIONAL**: Divergence strategy doesn't require oracle
+- **DYNAMIC STOP LOSS**: Uses absolute price move ($0.03) instead of fixed percentage
+- **EXTREME PRICE FILTER**: Only blocks "favorites" (>$0.92), allows "underdogs" (<$0.10)
 
 **Signal Detection Tuning:**
-- Volume surge filter: **DISABLED** (was always <1.0x due to calculation issue)
-- Spike concentration filter: **DISABLED** (was always 0%)
-- PM staleness minimum: **DISABLED** (PM updates faster than expected)
-- PM staleness maximum: Increased to 600s
-- Min spot move: Lowered to 0.05% (testing)
-- Min liquidity: Lowered to €1 (testing)
+- Min divergence: Lowered to 5% (from 8%)
+- PM staleness maximum: Increased to 900s (15 min)
+- Min spot move: **DISABLED** (divergence is primary signal)
+- Volume surge filter: **DISABLED** (weight=0)
+- Spike concentration filter: **DISABLED** (weight=0)
+- Min agreement score: Lowered to 70%
+- Consensus tolerance: Increased to 0.20%
 
 **Discord Alerter Improvements:**
-- Fresh HTTP client per request (avoids stale connection issues)
-- Timeout increased to 30s for all operations
-- Better retry logic with exponential backoff
-
-**Logging Improvements:**
-- Signal rejections now logged at INFO level (visible in normal logs)
-- Shows exactly which filter blocked each signal
-- 30-second rejection stats summary
-- High divergence override logged as 🚀
+- HTTP/2 disabled (compatibility)
+- Increased timeouts (15-20s)
+- Better retry logic with jitter
+- Rate limit detection and backoff
+- Consecutive failure tracking
 
 **VPS Deployment:**
 - Complete VPS setup guide added (VPS_SETUP.md)
@@ -1170,8 +1199,10 @@ polybot/
 
 ### Future Enhancements
 
-- [ ] Fix volume surge calculation (currently disabled)
-- [ ] Fix spike concentration calculation (currently disabled)
+- [ ] Fix volume surge calculation (currently disabled, weight=0)
+- [ ] Fix spike concentration calculation (currently disabled, weight=0)
+- [ ] Dual-region WebSocket mesh (EU + Asia for redundancy)
+- [ ] Maker-only strategy (0% fees + rebates)
 - [ ] Historical backtesting module
 - [ ] Machine learning signal enhancement
 - [ ] Additional assets (DOGE, AVAX, etc.)
