@@ -334,6 +334,14 @@ class TradingBot:
         if not signal:
             return
         
+        # Trigger high activity mode on PM feed for faster polling
+        if self.multi_asset and asset in self.multi_asset.asset_feeds:
+            pm_feed = self.multi_asset.asset_feeds[asset].polymarket
+            if pm_feed:
+                pm_feed.trigger_high_activity_mode(duration_seconds=30.0)
+        elif self.polymarket_feed:
+            self.polymarket_feed.trigger_high_activity_mode(duration_seconds=30.0)
+        
         # Tag signal with asset
         signal.market_id = f"{asset}_{signal.market_id}"
         

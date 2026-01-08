@@ -80,6 +80,191 @@ class MarketQualityScore:
     
     def __str__(self) -> str:
         return f"Quality: {self.total_score:.2f} (liq={self.liquidity_score:.2f}, age={self.age_score:.2f}, spread={self.spread_score:.2f}, ttc={self.time_to_close_score:.2f})"
+
+
+@dataclass
+class CachedMarket:
+    """A cached market with metadata."""
+    market: DiscoveredMarket
+    token_ids: dict  # {yes_token_id, no_token_id}
+    fetched_at_ms: int
+    window_end_ts: int  # Unix timestamp of window end
+    
+    @property
+    def age_seconds(self) -> float:
+        """Get cache entry age in seconds."""
+        return (int(time.time() * 1000) - self.fetched_at_ms) / 1000
+    
+    @property
+    def is_stale(self) -> bool:
+        """Check if cache entry is stale (>5 minutes old)."""
+        return self.age_seconds > 300
+
+
+class MarketCache:
+    """
+    Caches discovered markets to eliminate discovery latency spikes.
+    
+    Pre-fetches:
+    - Current window
+    - Next window (+15 min)
+    - Window after (+30 min)
+    
+    Benefits:
+    - Instant market switching at window boundaries
+    - Eliminates discovery API call latency during signals
+    - Handles API failures gracefully with cached fallback
+    """
+    
+    def __init__(self, asset: str = "BTC"):
+        self.asset = asset.upper()
+        self.logger = logger.bind(component="market_cache", asset=self.asset)
+        self._cache: dict[int, CachedMarket] = {}  # window_end_ts -> CachedMarket
+        self._discovery = MarketDiscovery(asset=asset)
+        self._priming_task: Optional[asyncio.Task] = None
+        self._running = False
+    
+    async def start(self) -> None:
+        """Start the cache priming background task."""
+        self._running = True
+        self._priming_task = asyncio.create_task(self._prime_loop())
+        self.logger.info("Market cache started")
+    
+    async def stop(self) -> None:
+        """Stop the cache priming task."""
+        self._running = False
+        if self._priming_task:
+            self._priming_task.cancel()
+            try:
+                await self._priming_task
+            except asyncio.CancelledError:
+                pass
+        self.logger.info("Market cache stopped")
+    
+    async def _prime_loop(self) -> None:
+        """Background task that keeps cache primed with upcoming windows."""
+        while self._running:
+            try:
+                await self._prime_upcoming_windows()
+                # Re-prime every 60 seconds
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Cache priming error", error=str(e))
+                await asyncio.sleep(30)
+    
+    async def _prime_upcoming_windows(self) -> None:
+        """Pre-fetch markets for current and upcoming windows."""
+        now = int(time.time())
+        interval = 900  # 15 minutes
+        
+        # Calculate window timestamps to prime
+        current_window_end = ((now // interval) + 1) * interval
+        windows_to_prime = [
+            current_window_end,                  # Current
+            current_window_end + interval,       # Next
+            current_window_end + (2 * interval), # +30 min
+        ]
+        
+        # Clean up old entries
+        self._cleanup_old_entries(current_window_end - interval)
+        
+        # Fetch any missing windows
+        for window_ts in windows_to_prime:
+            if window_ts not in self._cache or self._cache[window_ts].is_stale:
+                await self._fetch_and_cache(window_ts)
+    
+    async def _fetch_and_cache(self, window_ts: int) -> Optional[CachedMarket]:
+        """Fetch market for a specific window and cache it."""
+        try:
+            # Generate slug for this specific window
+            slugs = [f"{slug_base}-{window_ts}" for slug_base in self._discovery._patterns["slugs"]]
+            
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            async with httpx.AsyncClient(verify=ssl_context, timeout=10.0) as client:
+                for slug in slugs:
+                    try:
+                        response = await client.get(
+                            f"{self._discovery.GAMMA_API_URL}/markets",
+                            params={"slug": slug},
+                        )
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            markets_data = data if isinstance(data, list) else [data] if data else []
+                            
+                            for market_data in markets_data:
+                                if not market_data or market_data.get("closed", False):
+                                    continue
+                                
+                                # Parse tokens
+                                tokens_raw = market_data.get("clobTokenIds", [])
+                                if isinstance(tokens_raw, str):
+                                    tokens = orjson.loads(tokens_raw)
+                                else:
+                                    tokens = tokens_raw
+                                
+                                if len(tokens) >= 2:
+                                    cached = CachedMarket(
+                                        market=DiscoveredMarket(
+                                            condition_id=market_data.get("conditionId", ""),
+                                            question=market_data.get("question", ""),
+                                            description=market_data.get("description", ""),
+                                            end_date_iso=market_data.get("endDate", ""),
+                                            tokens=[{"token_id": t} for t in tokens],
+                                            outcome="up",
+                                        ),
+                                        token_ids={
+                                            "yes": tokens[0],
+                                            "no": tokens[1],
+                                        },
+                                        fetched_at_ms=int(time.time() * 1000),
+                                        window_end_ts=window_ts,
+                                    )
+                                    self._cache[window_ts] = cached
+                                    self.logger.debug(
+                                        "Cached market",
+                                        window_ts=window_ts,
+                                        condition_id=cached.market.condition_id[:20] + "...",
+                                    )
+                                    return cached
+                    except Exception as e:
+                        self.logger.debug("Slug fetch failed", slug=slug, error=str(e))
+                        continue
+            
+            return None
+            
+        except Exception as e:
+            self.logger.warning("Failed to fetch market for cache", window_ts=window_ts, error=str(e))
+            return None
+    
+    def _cleanup_old_entries(self, cutoff_ts: int) -> None:
+        """Remove cache entries older than cutoff."""
+        old_keys = [ts for ts in self._cache if ts < cutoff_ts]
+        for key in old_keys:
+            del self._cache[key]
+    
+    def get_cached_market(self, window_ts: int) -> Optional[CachedMarket]:
+        """Get a cached market for a specific window."""
+        return self._cache.get(window_ts)
+    
+    def get_current_cached_market(self) -> Optional[CachedMarket]:
+        """Get the cached market for the current window."""
+        now = int(time.time())
+        interval = 900
+        current_window_end = ((now // interval) + 1) * interval
+        return self._cache.get(current_window_end)
+    
+    @property
+    def cache_size(self) -> int:
+        """Get number of cached markets."""
+        return len(self._cache)
+    
+    @property
+    def cached_windows(self) -> list[int]:
+        """Get list of cached window timestamps."""
+        return sorted(self._cache.keys())
     
 
 class MarketDiscovery:
@@ -796,6 +981,14 @@ class PolymarketFeed:
         self._no_fee_rate_bps: int = 0
         self._fee_rate_fetched_at: float = 0.0
         self._fee_rate_ttl: float = 60.0  # Refresh fee rates every 60 seconds
+        
+        # NEW: Adaptive snapshot frequency
+        # Fast polling (200ms) during high activity, slow (1s) during quiet periods
+        self._high_activity_mode: bool = False
+        self._high_activity_until_ms: int = 0
+        self._base_interval: float = snapshot_interval  # Store original interval
+        self._fast_interval: float = 0.2  # 200ms during action
+        self._slow_interval: float = 1.0  # 1s during quiet
     
     def add_callback(self, callback: Callable[[PolymarketData], None]) -> None:
         """Register a callback for orderbook updates."""
@@ -808,6 +1001,40 @@ class PolymarketFeed:
                 callback(data)
             except Exception as e:
                 self.logger.error("Callback error", error=str(e))
+    
+    def trigger_high_activity_mode(self, duration_seconds: float = 30.0) -> None:
+        """
+        Trigger high activity mode for faster polling.
+        
+        Called when:
+        - Divergence detected
+        - Freeze detected
+        - Signal generated
+        
+        Increases polling from 1s to 200ms for the specified duration.
+        """
+        now_ms = int(time.time() * 1000)
+        self._high_activity_until_ms = now_ms + int(duration_seconds * 1000)
+        self._high_activity_mode = True
+        self.logger.debug(
+            "High activity mode triggered",
+            duration=f"{duration_seconds}s",
+            interval="200ms",
+        )
+    
+    def _get_current_interval(self) -> float:
+        """Get the current polling interval based on activity mode."""
+        now_ms = int(time.time() * 1000)
+        
+        if self._high_activity_mode:
+            if now_ms < self._high_activity_until_ms:
+                return self._fast_interval  # 200ms
+            else:
+                # High activity expired, switch back to slow
+                self._high_activity_mode = False
+                self.logger.debug("High activity mode expired, returning to slow polling")
+        
+        return self._slow_interval  # 1s
     
     async def _connect(self) -> bool:
         """Initialize HTTP client and fetch token IDs."""
@@ -1267,9 +1494,14 @@ class PolymarketFeed:
                         snapshot = self._create_snapshot()
                         if snapshot:
                             self._notify_callbacks(snapshot)
+                            
+                            # Auto-trigger high activity on freeze detection
+                            if snapshot.orderbook_freeze_detected:
+                                self.trigger_high_activity_mode(duration_seconds=15.0)
                 
-                # Wait for next poll interval
-                await asyncio.sleep(self.snapshot_interval)
+                # Wait for next poll interval (adaptive)
+                interval = self._get_current_interval()
+                await asyncio.sleep(interval)
                 
             except asyncio.CancelledError:
                 self.logger.info("Poll loop cancelled")
