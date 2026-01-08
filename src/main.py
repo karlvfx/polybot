@@ -448,6 +448,17 @@ class TradingBot:
                 feeds_serializable = {}
                 for name, feed in exchange_feeds.items():
                     if feed:
+                        # Check for geo-blocked feeds
+                        if hasattr(feed, 'is_disabled') and feed.is_disabled:
+                            feeds_serializable[name] = {
+                                "connected": False,
+                                "price": 0,
+                                "is_stale": False,  # Not stale, just unavailable
+                                "geo_blocked": True,
+                                "error_count": feed.health.error_count,
+                            }
+                            continue
+                        
                         metrics = feed.get_metrics()
                         feeds_serializable[name] = {
                             "connected": feed.health.connected,
@@ -488,6 +499,11 @@ class TradingBot:
                     exchange_status = []
                     for name, feed in exchange_feeds.items():
                         if feed:
+                            # Check for geo-blocking first
+                            if hasattr(feed, 'is_disabled') and feed.is_disabled:
+                                exchange_status.append(f"{name.capitalize()}: 🚫 Geo-blocked")
+                                continue
+                            
                             metrics = feed.get_metrics()
                             connected = "✅" if feed.health.connected else "❌"
                             price = metrics.current_price if hasattr(metrics, 'current_price') else 0

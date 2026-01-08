@@ -238,6 +238,10 @@ class BaseFeed(ABC):
         self._running = False
         self._callbacks: list[Callable[[Any], None]] = []
         
+        # Geo-blocking detection - stops reconnecting if HTTP 451/403 received
+        self._geo_blocked = False
+        self._permanent_failure_reason: Optional[str] = None
+        
         self.logger = logger.bind(feed=name)
     
     def add_callback(self, callback: Callable[[Any], None]) -> None:
@@ -285,6 +289,10 @@ class BaseFeed(ABC):
     
     async def _connect(self) -> bool:
         """Establish WebSocket connection with fast timeout."""
+        # Check if permanently blocked (e.g., geo-blocked)
+        if self._geo_blocked:
+            return False
+        
         try:
             # Create SSL context with certifi certificates for wss:// connections
             ssl_context = None
@@ -322,13 +330,33 @@ class BaseFeed(ABC):
             self.logger.warning("Connection timeout (5s)")
             return False
         except Exception as e:
+            error_str = str(e)
             self.health.connected = False
             self.health.error_count += 1
-            self.logger.error("Connection failed", error=str(e))
+            
+            # Detect geo-blocking or permanent HTTP errors
+            # HTTP 451 = Unavailable For Legal Reasons (Binance blocks US IPs)
+            # HTTP 403 = Forbidden (also used for geo-blocking)
+            if "HTTP 451" in error_str or "HTTP 403" in error_str:
+                self._geo_blocked = True
+                self._permanent_failure_reason = error_str
+                self.logger.warning(
+                    "🚫 GEO-BLOCKED - Feed disabled permanently",
+                    reason=error_str,
+                    hint="This feed is not available from your region"
+                )
+                return False
+            
+            self.logger.error("Connection failed", error=error_str)
             return False
     
     async def _reconnect(self) -> None:
         """Handle reconnection with exponential backoff + jitter."""
+        # Don't reconnect if geo-blocked
+        if self._geo_blocked:
+            self.logger.debug("Skipping reconnect - feed is geo-blocked")
+            return
+        
         # Record disconnection event
         session_tracker.record_connection_event(
             feed_name=self.name,
@@ -336,7 +364,7 @@ class BaseFeed(ABC):
         )
         
         delay = self.reconnect_delay
-        while self._running:
+        while self._running and not self._geo_blocked:
             self.health.reconnect_count += 1
             
             # Add jitter (±30%) to prevent thundering herd
@@ -355,12 +383,23 @@ class BaseFeed(ABC):
                 # Reset delay on successful reconnect
                 return
             
+            # If geo-blocked detected during connect, stop immediately
+            if self._geo_blocked:
+                return
+            
             await asyncio.sleep(jittered_delay)
             delay = min(delay * 2, self.max_reconnect_delay)
     
     async def _receive_loop(self) -> None:
         """Main loop for receiving messages."""
         while self._running:
+            # Stop loop if geo-blocked
+            if self._geo_blocked:
+                self.logger.info("Feed loop stopped - geo-blocked")
+                # Sleep forever (until cancelled) to prevent loop spinning
+                await asyncio.sleep(3600)
+                continue
+            
             try:
                 if not self._ws:
                     await self._reconnect()
@@ -465,6 +504,11 @@ class BaseFeed(ABC):
         
         self.health.connected = False
     
+    @property
+    def is_disabled(self) -> bool:
+        """Check if this feed has been permanently disabled (geo-blocked, etc.)."""
+        return self._geo_blocked
+    
     def get_metrics(self) -> dict:
         """Get current metrics for this feed."""
         return {
@@ -475,5 +519,6 @@ class BaseFeed(ABC):
             "reconnect_count": self.health.reconnect_count,
             "error_count": self.health.error_count,
             "current_price": self.price_buffer.current_price,
+            "geo_blocked": self._geo_blocked,
         }
 
