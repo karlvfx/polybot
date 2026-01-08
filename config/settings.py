@@ -136,9 +136,10 @@ class SignalSettings(BaseSettings):
     # Mispricing detection (legacy - kept for backward compat)
     min_mispricing_pct: float = 0.03  # 3% mispricing required
     
-    # Liquidity
-    min_liquidity_eur: float = 1.0  # EUR at best price (very low for testing)
-    liquidity_collapse_threshold: float = 0.60  # Alert if <60% of 30s ago
+    # Liquidity - UPDATED: Increased from €1 (way too low!)
+    # At €1, you're trading into markets with €10-50 total liquidity
+    min_liquidity_eur: float = 50.0  # EUR at best price - need enough to fill €20 position
+    liquidity_collapse_threshold: float = 0.50  # 50% drop triggers alert (was 60% - too sensitive)
 
 
 class ConfidenceWeights(BaseSettings):

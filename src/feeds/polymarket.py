@@ -1314,10 +1314,23 @@ class PolymarketFeed:
         else:
             implied_prob = 0.5  # Default if no data
         
-        # Check for liquidity collapse
+        # Check for liquidity collapse (IMPROVED)
+        # Old logic was too sensitive for thin markets - flagged normal fluctuations
+        # New logic: Only flag collapse if BOTH conditions are met:
+        #   1. Percentage drop > 50% (was 40%)
+        #   2. AND absolute liquidity is dangerously low (< €25)
+        # This prevents false positives in naturally thin markets
         liquidity_collapsing = False
-        if yes_liq_30s > 0:
-            liquidity_collapsing = current_yes_liq < 0.6 * yes_liq_30s
+        MIN_ABSOLUTE_LIQUIDITY = 25.0  # €25 floor
+        COLLAPSE_THRESHOLD_PCT = 0.50  # 50% drop (was 60%, i.e., < 0.6 * historical)
+        
+        if yes_liq_30s > 0 and current_yes_liq > 0:
+            pct_of_historical = current_yes_liq / yes_liq_30s
+            is_major_drop = pct_of_historical < COLLAPSE_THRESHOLD_PCT
+            is_below_absolute_floor = current_yes_liq < MIN_ABSOLUTE_LIQUIDITY
+            
+            # Only flag as collapsing if it's both a major drop AND below safety floor
+            liquidity_collapsing = is_major_drop and is_below_absolute_floor
         
         # Calculate proper orderbook imbalance (YES vs NO depth)
         # Positive = YES-heavy, Negative = NO-heavy
