@@ -180,6 +180,43 @@ class ConfidenceScorer:
         
         return min(1.0, (concentration - 0.4) / 0.3)
     
+    def _score_obi_bonus(
+        self,
+        obi_ratio: float,
+        direction: str,
+    ) -> float:
+        """
+        Calculate OBI (Order Book Imbalance) confidence bonus.
+        
+        OBI ranges from -1 (NO-heavy) to +1 (YES-heavy).
+        When OBI confirms signal direction, add confidence bonus.
+        
+        Args:
+            obi_ratio: -1 to +1 (positive = YES-heavy, negative = NO-heavy)
+            direction: "UP" or "DOWN"
+            
+        Returns:
+            0.0 to 0.10 (up to +10% confidence bonus)
+        """
+        # Signal direction vs OBI alignment
+        # UP signal: Want YES-heavy (positive OBI) = more people betting UP
+        # DOWN signal: Want NO-heavy (negative OBI) = more people betting DOWN
+        
+        if direction == "UP":
+            # UP signal: positive OBI (YES-heavy) confirms
+            if obi_ratio > 0.3:  # Strong YES-heavy
+                return min(0.10, (obi_ratio - 0.3) * 0.15)
+            elif obi_ratio < -0.3:  # Strong NO-heavy (contradicts UP)
+                return 0.0  # No bonus, but also no penalty
+        else:  # DOWN
+            # DOWN signal: negative OBI (NO-heavy) confirms
+            if obi_ratio < -0.3:  # Strong NO-heavy
+                return min(0.10, (abs(obi_ratio) - 0.3) * 0.15)
+            elif obi_ratio > 0.3:  # Strong YES-heavy (contradicts DOWN)
+                return 0.0  # No bonus, but also no penalty
+        
+        return 0.0  # Neutral OBI = no bonus
+    
     def _score_maker_advantage(
         self,
         pm_data,  # PolymarketData
@@ -301,6 +338,13 @@ class ConfidenceScorer:
         # Maker advantage score - DISABLED (reduce noise)
         maker_score = 0.0  # self._score_maker_advantage(...)
         
+        # NEW: OBI (Order Book Imbalance) bonus - up to +10% confidence
+        # Strong imbalance confirming direction = high conviction
+        obi_bonus = self._score_obi_bonus(
+            pm.orderbook_imbalance_ratio,
+            signal.direction.value if signal.direction else "UP",
+        )
+        
         # Create breakdown
         breakdown = ConfidenceBreakdown(
             divergence=divergence_score,
@@ -320,8 +364,20 @@ class ConfidenceScorer:
             self.weights.liquidity_weight * liquidity_score +
             self.weights.volume_surge_weight * volume_score +
             self.weights.spike_concentration_weight * spike_score +
-            self.weights.maker_advantage_weight * maker_score  # Fee-aware bonus
+            self.weights.maker_advantage_weight * maker_score
         )
+        
+        # Add OBI bonus (up to +10% confidence when OBI confirms direction)
+        confidence += obi_bonus
+        
+        # Log if OBI boost applied
+        if obi_bonus > 0.01:
+            self.logger.debug(
+                "OBI confidence boost applied",
+                obi_ratio=f"{pm.orderbook_imbalance_ratio:+.2f}",
+                direction=signal.direction.value if signal.direction else "N/A",
+                boost=f"+{obi_bonus:.1%}",
+            )
         
         # Apply probability normalization penalty (if YES + NO != 1.0)
         _, _, prob_penalty = pm.get_normalized_probabilities()

@@ -3,7 +3,7 @@ Coinbase Exchange WebSocket feed for BTC/USD real-time price data.
 """
 
 import asyncio
-import json
+import orjson  # 2-3x faster than stdlib json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -60,13 +60,13 @@ class CoinbaseFeed(BaseFeed):
             "channels": ["matches"]
         }
         
-        await self._ws.send(json.dumps(subscribe_msg))
+        await self._ws.send(orjson.dumps(subscribe_msg).decode())
         self.logger.info("Sent subscription request", product_id=self.product_id)
     
     async def _handle_message(self, message: str) -> None:
         """Parse and process Coinbase match message."""
         try:
-            data = json.loads(message)
+            data = orjson.loads(message)
             msg_type = data.get("type")
             
             # Handle subscription confirmation
@@ -125,7 +125,7 @@ class CoinbaseFeed(BaseFeed):
                     reason=data.get("reason"),
                 )
                 
-        except json.JSONDecodeError as e:
+        except orjson.JSONDecodeError as e:
             self.logger.error("JSON decode error", error=str(e))
         except KeyError as e:
             self.logger.error("Missing key in message", error=str(e))

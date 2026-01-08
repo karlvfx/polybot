@@ -3,7 +3,7 @@ Kraken WebSocket feed for BTC/USD real-time price data.
 """
 
 import asyncio
-import json
+import orjson  # 2-3x faster than stdlib json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -62,13 +62,13 @@ class KrakenFeed(BaseFeed):
             }
         }
         
-        await self._ws.send(json.dumps(subscribe_msg))
+        await self._ws.send(orjson.dumps(subscribe_msg).decode())
         self.logger.info("Sent subscription request", pair=self.pair)
     
     async def _handle_message(self, message: str) -> None:
         """Parse and process Kraken trade message."""
         try:
-            data = json.loads(message)
+            data = orjson.loads(message)
             
             # Handle event messages (dict format)
             if isinstance(data, dict):
@@ -135,7 +135,7 @@ class KrakenFeed(BaseFeed):
                                 )
                                 self._notify_callbacks(exchange_tick)
                     
-        except json.JSONDecodeError as e:
+        except orjson.JSONDecodeError as e:
             self.logger.error("JSON decode error", error=str(e))
         except Exception as e:
             self.logger.error("Error handling message", error=str(e))
@@ -180,7 +180,7 @@ class KrakenFeed(BaseFeed):
                     try:
                         # Kraken uses JSON ping
                         ping_msg = {"event": "ping"}
-                        await self._ws.send(json.dumps(ping_msg))
+                        await self._ws.send(orjson.dumps(ping_msg).decode())
                         self.health.last_heartbeat_ms = int(time.time() * 1000)
                     except (ConnectionClosed, AttributeError, Exception):
                         # Connection closed or invalid - silently skip

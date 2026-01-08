@@ -11,7 +11,7 @@ Enhanced features:
 """
 
 import asyncio
-import json
+import orjson  # 2-3x faster than stdlib json
 import re
 import ssl
 import time
@@ -345,7 +345,7 @@ class MarketDiscovery:
                             # Parse clobTokenIds (may be JSON string)
                             tokens_raw = market.get("clobTokenIds", [])
                             if isinstance(tokens_raw, str):
-                                tokens = json.loads(tokens_raw)
+                                tokens = orjson.loads(tokens_raw)
                             else:
                                 tokens = tokens_raw
                             
@@ -358,7 +358,7 @@ class MarketDiscovery:
                                 # Try to get liquidity from outcomePrices or volume
                                 outcome_prices = market.get("outcomePrices", "")
                                 if isinstance(outcome_prices, str) and outcome_prices:
-                                    prices = json.loads(outcome_prices)
+                                    prices = orjson.loads(outcome_prices)
                                     if len(prices) >= 2:
                                         spread = abs(float(prices[0]) - float(prices[1]))
                                 
@@ -473,7 +473,7 @@ class MarketDiscovery:
                                 tokens_raw = m.get("clobTokenIds", [])
                                 if isinstance(tokens_raw, str):
                                     try:
-                                        tokens = json.loads(tokens_raw)
+                                        tokens = orjson.loads(tokens_raw)
                                     except:
                                         tokens = []
                                 else:
@@ -900,7 +900,7 @@ class PolymarketFeed:
                 tokens = self._discovered_market.tokens
                 # Parse if it's a JSON string
                 if isinstance(tokens, str):
-                    tokens = json.loads(tokens)
+                    tokens = orjson.loads(tokens)
                 if len(tokens) >= 2:
                     self._yes_token_id = tokens[0] if isinstance(tokens[0], str) else tokens[0].get("token_id")
                     self._no_token_id = tokens[1] if isinstance(tokens[1], str) else tokens[1].get("token_id")

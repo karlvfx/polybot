@@ -2,7 +2,7 @@
 Binance WebSocket feed for BTC/USDT real-time price data.
 """
 
-import json
+import orjson  # 2-3x faster than stdlib json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -73,7 +73,7 @@ class BinanceFeed(BaseFeed):
     async def _handle_message(self, message: str) -> None:
         """Parse and process Binance trade message."""
         try:
-            data = json.loads(message)
+            data = orjson.loads(message)
             
             # Handle trade event
             if data.get("e") == "trade":
@@ -113,7 +113,7 @@ class BinanceFeed(BaseFeed):
                 
                 self._notify_callbacks(exchange_tick)
                 
-        except json.JSONDecodeError as e:
+        except orjson.JSONDecodeError as e:
             self.logger.error("JSON decode error", error=str(e), message=message[:100])
         except KeyError as e:
             self.logger.error("Missing key in message", error=str(e))
@@ -240,7 +240,7 @@ class BinanceAggTradeFeed(BaseFeed):
     async def _handle_message(self, message: str) -> None:
         """Parse aggregated trade message."""
         try:
-            data = json.loads(message)
+            data = orjson.loads(message)
             
             if data.get("e") == "aggTrade":
                 price = float(data["p"])
