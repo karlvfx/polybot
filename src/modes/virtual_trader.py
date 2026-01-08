@@ -266,22 +266,32 @@ class VirtualTrader:
             )
             return None  # Return None instead of broken position
         
-        # EXTREME PRICE FILTER: Avoid very low/high priced entries
-        # At $0.02, a move to $0.01 = -50% loss in 1 second (ungappable)
-        # At $0.98, a move to $0.99 = +1% gain max (no upside)
-        # Safe zone: $0.10 - $0.90 (10% - 90% odds)
-        MIN_SAFE_PRICE = 0.10
-        MAX_SAFE_PRICE = 0.90
+        # EXTREME PRICE FILTER: Only block FAVORITES with no upside
+        # Underdog bets ($0.05-$0.10) have GREAT risk/reward (16-20x potential)
+        # Favorite bets ($0.90-$0.95) have POOR risk/reward (1.05-1.11x potential)
+        # 
+        # Only block: Buying YES >$0.92 or buying NO >$0.92
+        # Allow: Buying underdog at any price (great asymmetric return)
+        MAX_FAVORITE_PRICE = 0.92  # Don't buy favorites above 92%
         
-        if entry_price < MIN_SAFE_PRICE or entry_price > MAX_SAFE_PRICE:
+        if entry_price > MAX_FAVORITE_PRICE:
             self.logger.info(
-                "⚠️ Extreme price - skipping position",
+                "⚠️ Favorite too expensive - skipping position",
                 side=side,
                 entry_price=f"${entry_price:.3f}",
-                safe_range=f"${MIN_SAFE_PRICE:.2f}-${MAX_SAFE_PRICE:.2f}",
-                reason="Price too extreme - gap risk too high",
+                max_price=f"${MAX_FAVORITE_PRICE:.2f}",
+                reason="Limited upside on heavy favorites",
             )
             return None
+        
+        # Log if taking underdog bet (informational only)
+        if entry_price < 0.10:
+            self.logger.info(
+                "🎲 Underdog bet detected",
+                side=side,
+                entry_price=f"${entry_price:.3f}",
+                potential_return=f"{(1.0/entry_price):.1f}x",
+            )
         
         # Get additional context
         oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
