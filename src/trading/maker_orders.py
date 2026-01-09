@@ -19,7 +19,7 @@ import structlog
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
+    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY, SELL
     PY_CLOB_AVAILABLE = True
 except ImportError:
@@ -28,6 +28,7 @@ except ImportError:
     OrderArgs = None
     OrderType = None
     MarketOrderArgs = None
+    PartialCreateOrderOptions = None
     BUY = SELL = None
 
 from config.settings import settings
@@ -79,7 +80,8 @@ class MakerOrderExecutor:
     
     # Maker order configuration
     MAKER_TIMEOUT_SECONDS = 3.5  # Max wait for fill (edge decays quickly)
-    TICK_SIZE = 0.01  # Polymarket minimum price increment
+    TICK_SIZE = "0.01"  # Polymarket minimum price increment (as string for API)
+    NEG_RISK = False    # Standard YES/NO tokens
     MIN_SPREAD_FOR_MAKER = 0.02  # 2% minimum spread to place inside
     
     def __init__(
@@ -96,6 +98,9 @@ class MakerOrderExecutor:
         # Initialize client
         self._client: Optional[ClobClient] = None
         self._initialized = False
+        
+        # Cache for token tick sizes
+        self._tick_size_cache: Dict[str, str] = {}
         
         # Performance tracking
         self._fill_attempts = 0
@@ -124,15 +129,6 @@ class MakerOrderExecutor:
             # Derive API credentials
             self._client.set_api_creds(self._client.derive_api_key())
             
-            # Pre-configure tick sizes to avoid lookup errors
-            # Polymarket uses 0.01 (1 cent) for all markets
-            try:
-                # Try to set default tick size if the client supports it
-                if hasattr(self._client, 'tick_sizes'):
-                    self._client.tick_sizes = {}  # Will be populated per-market
-            except Exception:
-                pass  # Not all versions support this
-            
             self._initialized = True
             self.logger.info("Maker executor initialized successfully")
             return True
@@ -140,6 +136,25 @@ class MakerOrderExecutor:
         except Exception as e:
             self.logger.error("Failed to initialize maker executor", error=str(e))
             return False
+    
+    def _get_tick_size(self, token_id: str) -> str:
+        """Get tick size for a token (cached)."""
+        if token_id in self._tick_size_cache:
+            return self._tick_size_cache[token_id]
+        
+        # Try to fetch from API
+        try:
+            # Get market info for this token
+            market = self._client.get_market(token_id)
+            if isinstance(market, dict) and "minimum_tick_size" in market:
+                tick_size = market["minimum_tick_size"]
+                self._tick_size_cache[token_id] = tick_size
+                return tick_size
+        except Exception:
+            pass
+        
+        # Default to standard Polymarket tick size
+        return self.TICK_SIZE
     
     def _calculate_maker_price(
         self,
@@ -228,7 +243,10 @@ class MakerOrderExecutor:
             # Polymarket uses tick_size=0.01 and neg_risk=False for standard YES/NO tokens
             order_side = BUY if side == "BUY" else SELL
             
-            # Explicitly pass tick_size to avoid py-clob-client looking it up
+            # Get tick size for this token
+            tick_size = self._get_tick_size(token_id)
+            
+            # Build order args
             order_args = OrderArgs(
                 token_id=token_id,
                 price=maker_price,
@@ -236,27 +254,19 @@ class MakerOrderExecutor:
                 side=order_side,
             )
             
-            # Create and post order with explicit tick_size
+            # Create options with explicit tick_size
+            options = PartialCreateOrderOptions(
+                tick_size=tick_size,
+                neg_risk=self.NEG_RISK,
+            )
+            
+            # Create and post order
             try:
-                # Build the signed order with explicit tick_size
-                signed_order = self._client.create_order(
-                    order_args,
-                    options={
-                        "tick_size": "0.01",  # Polymarket standard tick size
-                        "neg_risk": False,    # Standard YES/NO tokens
-                    }
-                )
+                signed_order = self._client.create_order(order_args, options)
                 order = self._client.post_order(signed_order, OrderType.GTC)
-            except TypeError as te:
-                # Some versions use positional args differently
-                self.logger.debug(f"Options approach failed: {te}, trying alternative")
-                try:
-                    # Try with tick_size as string in options dict
-                    signed_order = self._client.create_order(order_args)
-                    order = self._client.post_order(signed_order, OrderType.GTC)
-                except Exception as e2:
-                    self.logger.error(f"Alternative also failed: {e2}")
-                    raise e2
+            except Exception as e:
+                self.logger.error(f"Order creation failed: {e}")
+                raise e
             
             order_id = order.get("orderID") or order.get("order_id")
             
