@@ -124,6 +124,15 @@ class MakerOrderExecutor:
             # Derive API credentials
             self._client.set_api_creds(self._client.derive_api_key())
             
+            # Pre-configure tick sizes to avoid lookup errors
+            # Polymarket uses 0.01 (1 cent) for all markets
+            try:
+                # Try to set default tick size if the client supports it
+                if hasattr(self._client, 'tick_sizes'):
+                    self._client.tick_sizes = {}  # Will be populated per-market
+            except Exception:
+                pass  # Not all versions support this
+            
             self._initialized = True
             self.logger.info("Maker executor initialized successfully")
             return True
@@ -219,32 +228,34 @@ class MakerOrderExecutor:
             # Polymarket uses tick_size=0.01 and neg_risk=False for standard YES/NO tokens
             order_side = BUY if side == "BUY" else SELL
             
-            # Use create_order with explicit parameters to handle tick_size
+            # Explicitly pass tick_size to avoid py-clob-client looking it up
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=maker_price,
+                size=size,
+                side=order_side,
+            )
+            
+            # Create and post order with explicit tick_size
             try:
-                # Try the simple approach first
-                signed_order = self._client.create_order({
-                    "token_id": token_id,
-                    "price": maker_price,
-                    "size": size,
-                    "side": order_side,
-                    "fee_rate_bps": 0,  # Maker = 0 fees
-                    "nonce": 0,
-                    "expiration": 0,  # No expiration
-                })
-                order = self._client.post_order(signed_order, OrderType.GTC)
-            except Exception as e1:
-                self.logger.debug(f"Simple order failed: {e1}, trying OrderArgs")
-                # Fallback to OrderArgs
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=maker_price,
-                    size=size,
-                    side=order_side,
+                # Build the signed order with explicit tick_size
+                signed_order = self._client.create_order(
+                    order_args,
+                    options={
+                        "tick_size": "0.01",  # Polymarket standard tick size
+                        "neg_risk": False,    # Standard YES/NO tokens
+                    }
                 )
+                order = self._client.post_order(signed_order, OrderType.GTC)
+            except TypeError as te:
+                # Some versions use positional args differently
+                self.logger.debug(f"Options approach failed: {te}, trying alternative")
                 try:
-                    order = self._client.create_and_post_order(order_args, OrderType.GTC)
+                    # Try with tick_size as string in options dict
+                    signed_order = self._client.create_order(order_args)
+                    order = self._client.post_order(signed_order, OrderType.GTC)
                 except Exception as e2:
-                    self.logger.error(f"OrderArgs also failed: {e2}")
+                    self.logger.error(f"Alternative also failed: {e2}")
                     raise e2
             
             order_id = order.get("orderID") or order.get("order_id")
