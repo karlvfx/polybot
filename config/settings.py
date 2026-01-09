@@ -372,6 +372,12 @@ class Settings(BaseSettings):
     # Operating mode
     mode: OperatingMode = OperatingMode.SHADOW
     
+    # Real trading toggle (requires private_key to be set)
+    real_trading_enabled: bool = Field(default=False, description="Enable real trading with actual money")
+    real_trading_position_size_eur: float = Field(default=20.0, description="Position size in EUR for real trades")
+    real_trading_max_daily_loss_eur: float = Field(default=100.0, description="Max daily loss before pausing real trades")
+    real_trading_max_concurrent_positions: int = Field(default=3, description="Max concurrent real positions")
+    
     # Assets to trade (comma-separated)
     assets: str = Field(default="BTC", description="Comma-separated list of assets to trade (BTC,ETH,SOL,XRP)")
     

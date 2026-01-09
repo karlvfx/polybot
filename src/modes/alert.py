@@ -1,5 +1,7 @@
 """
 Alert Mode - Human-in-the-loop trading with virtual simulation.
+
+Supports both virtual trading (simulation) and real trading when enabled.
 """
 
 import asyncio
@@ -10,6 +12,7 @@ import structlog
 
 from src.modes.base import BaseMode
 from src.modes.virtual_trader import VirtualTrader, VirtualPosition
+from src.trading.real_trader import RealTrader, RealPosition
 from src.models.schemas import (
     SignalCandidate,
     ActionData,
@@ -70,6 +73,19 @@ class AlertMode(BaseMode):
         else:
             self.logger.warning("No polymarket feed provided - virtual trader disabled")
         
+        # Real trader (initialized when real_trading_enabled is True)
+        self._real_trader: Optional[RealTrader] = None
+        self._real_trading_enabled = settings.real_trading_enabled
+        self._real_daily_loss = 0.0  # Track daily loss for circuit breaker
+        self._real_trades_today = 0
+        
+        if self._real_trading_enabled:
+            self.logger.warning(
+                "🔴 REAL TRADING MODE ENABLED - Real money will be used!",
+                position_size=f"€{settings.real_trading_position_size_eur}",
+                max_daily_loss=f"€{settings.real_trading_max_daily_loss_eur}",
+            )
+        
         # Alert tracking
         self._alerts_sent = 0
         self._last_alert_time_ms = 0
@@ -119,9 +135,42 @@ class AlertMode(BaseMode):
         """Activate alert mode and start periodic tasks."""
         super().activate()
         
+        # Initialize real trader if enabled
+        if self._real_trading_enabled:
+            asyncio.create_task(self._initialize_real_trader())
+        
         # Start hourly summary task
         if self._alerter:
             self._summary_task = asyncio.create_task(self._performance_summary_loop())
+    
+    async def _initialize_real_trader(self) -> None:
+        """Initialize real trader asynchronously."""
+        if not settings.private_key:
+            self.logger.error(
+                "🔴 REAL TRADING DISABLED - No private key configured!",
+                hint="Set PRIVATE_KEY in .env file"
+            )
+            self._real_trading_enabled = False
+            return
+        
+        self._real_trader = RealTrader(
+            polymarket_feed=self._polymarket_feed,
+            position_size_eur=settings.real_trading_position_size_eur,
+        )
+        
+        if await self._real_trader.initialize():
+            self._real_trader.set_callbacks(
+                on_opened=self._on_real_position_opened,
+                on_closed=self._on_real_position_closed,
+            )
+            self.logger.info(
+                "🟢 Real trader initialized successfully",
+                position_size=f"€{settings.real_trading_position_size_eur}",
+            )
+        else:
+            self.logger.error("Failed to initialize real trader - falling back to virtual")
+            self._real_trading_enabled = False
+            self._real_trader = None
     
     async def deactivate(self) -> None:
         """Deactivate alert mode and cleanup."""
@@ -130,6 +179,10 @@ class AlertMode(BaseMode):
         # Stop virtual trader
         if self._virtual_trader:
             await self._virtual_trader.stop()
+        
+        # Stop real trader
+        if self._real_trader:
+            await self._real_trader.stop()
         
         # Cancel summary task
         if self._summary_task and not self._summary_task.done():
@@ -227,7 +280,39 @@ class AlertMode(BaseMode):
             if market_info and hasattr(market_info, "question"):
                 market_title = market_info.question[:100]
         
-        # Open virtual position if virtual trader is available
+        # ======================================================================
+        # REAL TRADING (if enabled)
+        # ======================================================================
+        real_position_opened = False
+        if self._real_trading_enabled and self._real_trader:
+            # Safety checks
+            can_trade = self._check_real_trading_limits()
+            
+            if can_trade:
+                try:
+                    pm_data = signal.polymarket
+                    if pm_data and pm_data.yes_ask > 0:
+                        real_position = await self._real_trader.open_position(
+                            signal=signal,
+                            pm_data=pm_data,
+                            asset=asset,
+                        )
+                        if real_position:
+                            real_position_opened = True
+                            self._real_trades_today += 1
+                            self.logger.info(
+                                "🔴 REAL POSITION OPENED",
+                                asset=asset,
+                                direction=signal.direction.value,
+                                entry_price=f"${real_position.entry_price:.3f}",
+                                size=f"€{real_position.size_eur:.2f}",
+                            )
+                except Exception as e:
+                    self.logger.error("Failed to open real position", error=str(e), exc_info=True)
+        
+        # ======================================================================
+        # VIRTUAL TRADING (always runs alongside real for tracking)
+        # ======================================================================
         virtual_position_opened = False
         if self._virtual_trader:
             try:
@@ -344,6 +429,93 @@ class AlertMode(BaseMode):
         await self._alerter.send_virtual_position_closed(
             position=position,
             performance=perf,
+        )
+    
+    # ==========================================================================
+    # Real Trading Callbacks & Helpers
+    # ==========================================================================
+    
+    def _check_real_trading_limits(self) -> bool:
+        """Check if real trading limits allow opening a new position."""
+        # Check daily loss limit
+        if self._real_daily_loss >= settings.real_trading_max_daily_loss_eur:
+            self.logger.warning(
+                "🛑 Real trading paused - daily loss limit reached",
+                daily_loss=f"€{self._real_daily_loss:.2f}",
+                limit=f"€{settings.real_trading_max_daily_loss_eur:.2f}",
+            )
+            return False
+        
+        # Check concurrent positions
+        if self._real_trader:
+            open_positions = len(self._real_trader.open_positions)
+            if open_positions >= settings.real_trading_max_concurrent_positions:
+                self.logger.info(
+                    "Max concurrent real positions reached",
+                    open=open_positions,
+                    max=settings.real_trading_max_concurrent_positions,
+                )
+                return False
+        
+        return True
+    
+    async def _on_real_position_opened(
+        self,
+        position: RealPosition,
+        signal: SignalCandidate,
+        pm_data: PolymarketData,
+    ) -> None:
+        """Callback when real position is opened."""
+        if not self._alerter:
+            return
+        
+        # Send Discord alert for real trade
+        await self._alerter.send_message(
+            title="🔴 REAL TRADE OPENED",
+            description=f"**{position.asset} {position.direction}**",
+            color=0xFF0000,  # Red for real money
+            fields=[
+                ("Entry Price", f"${position.entry_price:.3f}", True),
+                ("Size", f"€{position.size_eur:.2f}", True),
+                ("Order ID", position.order_id[:8] if position.order_id else "N/A", True),
+            ],
+        )
+    
+    async def _on_real_position_closed(
+        self,
+        position: RealPosition,
+    ) -> None:
+        """Callback when real position is closed."""
+        # Update daily P&L tracking
+        if position.realized_pnl_eur:
+            if position.realized_pnl_eur < 0:
+                self._real_daily_loss += abs(position.realized_pnl_eur)
+        
+        if not self._alerter:
+            return
+        
+        # Determine emoji and color
+        pnl = position.realized_pnl_eur or 0
+        if pnl >= 0:
+            emoji = "🟢"
+            color = 0x00FF00
+        else:
+            emoji = "🔴"
+            color = 0xFF0000
+        
+        # Send Discord alert for real trade close
+        await self._alerter.send_message(
+            title=f"{emoji} REAL TRADE CLOSED",
+            description=f"**{position.asset} {position.direction}** - {position.exit_reason}",
+            color=color,
+            fields=[
+                ("Entry", f"${position.entry_price:.3f}", True),
+                ("Exit", f"${position.exit_price:.3f}" if position.exit_price else "N/A", True),
+                ("P&L", f"€{pnl:+.2f}", True),
+                ("Duration", f"{position.duration_seconds:.0f}s", True),
+                ("Rebates", f"€{position.rebates_earned_eur:.4f}", True),
+                ("Today's Loss", f"€{self._real_daily_loss:.2f}", True),
+            ],
         )
     
     # ==========================================================================
