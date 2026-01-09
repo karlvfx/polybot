@@ -116,11 +116,12 @@ class MarketCache:
     - Handles API failures gracefully with cached fallback
     """
     
-    def __init__(self, asset: str = "BTC"):
+    def __init__(self, asset: str = "BTC", include_hourly: bool = True):
         self.asset = asset.upper()
+        self.include_hourly = include_hourly
         self.logger = logger.bind(component="market_cache", asset=self.asset)
         self._cache: dict[int, CachedMarket] = {}  # window_end_ts -> CachedMarket
-        self._discovery = MarketDiscovery(asset=asset)
+        self._discovery = MarketDiscovery(asset=asset, include_hourly=include_hourly)
         self._priming_task: Optional[asyncio.Task] = None
         self._running = False
     
@@ -155,20 +156,29 @@ class MarketCache:
                 await asyncio.sleep(30)
     
     async def _prime_upcoming_windows(self) -> None:
-        """Pre-fetch markets for current and upcoming windows."""
+        """Pre-fetch markets for current and upcoming windows (15m and hourly)."""
         now = int(time.time())
-        interval = 900  # 15 minutes
         
-        # Calculate window timestamps to prime
-        current_window_end = ((now // interval) + 1) * interval
+        # 15-minute windows
+        interval_15m = 900
+        current_15m = ((now // interval_15m) + 1) * interval_15m
         windows_to_prime = [
-            current_window_end,                  # Current
-            current_window_end + interval,       # Next
-            current_window_end + (2 * interval), # +30 min
+            current_15m,                      # Current 15m
+            current_15m + interval_15m,       # Next 15m
+            current_15m + (2 * interval_15m), # +30 min
         ]
         
+        # Add hourly windows if enabled
+        if self.include_hourly:
+            interval_1h = 3600
+            current_1h = ((now // interval_1h) + 1) * interval_1h
+            windows_to_prime.extend([
+                current_1h,                   # Current hourly
+                current_1h + interval_1h,     # Next hourly
+            ])
+        
         # Clean up old entries
-        self._cleanup_old_entries(current_window_end - interval)
+        self._cleanup_old_entries(current_15m - interval_15m)
         
         # Fetch any missing windows
         for window_ts in windows_to_prime:
@@ -178,8 +188,16 @@ class MarketCache:
     async def _fetch_and_cache(self, window_ts: int) -> Optional[CachedMarket]:
         """Fetch market for a specific window and cache it."""
         try:
-            # Generate slug for this specific window
-            slugs = [f"{slug_base}-{window_ts}" for slug_base in self._discovery._patterns["slugs"]]
+            # Determine if this is a 15m or 1h window based on alignment
+            is_hourly_window = (window_ts % 3600) == 0
+            
+            # Generate slugs for the appropriate interval
+            if is_hourly_window and self.include_hourly:
+                slug_bases = self._discovery._patterns.get("slugs_1h", []) + self._discovery._patterns.get("slugs_15m", [])
+            else:
+                slug_bases = self._discovery._patterns.get("slugs_15m", [])
+            
+            slugs = [f"{slug_base}-{window_ts}" for slug_base in slug_bases]
             
             ssl_context = ssl.create_default_context(cafile=certifi.where())
             async with httpx.AsyncClient(verify=ssl_context, timeout=10.0) as client:
@@ -293,34 +311,52 @@ class MarketDiscovery:
     MIN_TIME_TO_CLOSE = 600  # seconds - need at least 10 mins to trade safely
     
     # Asset-specific slug patterns and keywords
-    # Primary format: {asset}-updown-15m-{timestamp} (confirmed from Polymarket URLs)
-    # Fallback: {asset}-up-or-down-15m-{timestamp}
+    # Supports both 15-minute and hourly markets
+    # Primary format: {asset}-updown-{interval}-{timestamp}
     ASSET_PATTERNS = {
         "BTC": {
-            "slugs": [
-                "btc-updown-15m",           # Primary format (from polymarket.com/event/btc-updown-15m-*)
+            "slugs_15m": [
+                "btc-updown-15m",           # Primary format
                 "btc-up-or-down-15m",       # Alternative format
                 "bitcoin-updown-15m",       # Full name variant
+            ],
+            "slugs_1h": [
+                "btc-updown-1h",            # Hourly primary
+                "btc-up-or-down-1h",        # Hourly alternative
+                "btc-updown-hourly",        # Hourly variant
+                "bitcoin-updown-1h",        # Full name hourly
             ],
             "keywords": ["bitcoin", "btc"],
             "name": "Bitcoin",
             "tag_id": 235,  # Polymarket tag ID for Bitcoin
         },
         "ETH": {
-            "slugs": [
+            "slugs_15m": [
                 "eth-updown-15m",           # Primary format
                 "eth-up-or-down-15m",       # Alternative format
                 "ethereum-updown-15m",      # Full name variant
+            ],
+            "slugs_1h": [
+                "eth-updown-1h",            # Hourly primary
+                "eth-up-or-down-1h",        # Hourly alternative
+                "eth-updown-hourly",        # Hourly variant
+                "ethereum-updown-1h",       # Full name hourly
             ],
             "keywords": ["ethereum", "eth"],
             "name": "Ethereum",
             "tag_id": 236,  # Polymarket tag ID for Ethereum
         },
         "SOL": {
-            "slugs": [
+            "slugs_15m": [
                 "sol-updown-15m",           # Primary format
                 "sol-up-or-down-15m",       # Alternative format
                 "solana-updown-15m",        # Full name variant
+            ],
+            "slugs_1h": [
+                "sol-updown-1h",            # Hourly primary
+                "sol-up-or-down-1h",        # Hourly alternative
+                "sol-updown-hourly",        # Hourly variant
+                "solana-updown-1h",         # Full name hourly
             ],
             "keywords": ["solana", "sol"],
             "name": "Solana",
@@ -328,8 +364,13 @@ class MarketDiscovery:
         },
     }
     
-    def __init__(self, asset: str = "BTC"):
+    # Supported market intervals
+    INTERVAL_15M = 15 * 60   # 900 seconds
+    INTERVAL_1H = 60 * 60    # 3600 seconds
+    
+    def __init__(self, asset: str = "BTC", include_hourly: bool = True):
         self.asset = asset.upper()
+        self.include_hourly = include_hourly
         self.logger = logger.bind(component="market_discovery", asset=self.asset)
         
         # Get asset-specific patterns
@@ -337,10 +378,15 @@ class MarketDiscovery:
             self.logger.warning(f"Unknown asset {self.asset}, using BTC patterns")
             self.asset = "BTC"
         self._patterns = self.ASSET_PATTERNS[self.asset]
+        
+        # Combined slugs for backwards compatibility
+        self._patterns["slugs"] = self._patterns.get("slugs_15m", [])
+        if self.include_hourly:
+            self._patterns["slugs"] = self._patterns["slugs"] + self._patterns.get("slugs_1h", [])
     
-    def _get_current_window_timestamps(self) -> list[int]:
+    def _get_window_timestamps_for_interval(self, interval_seconds: int) -> list[int]:
         """
-        Get timestamps for current and upcoming 15-minute windows.
+        Get timestamps for current and upcoming windows of a given interval.
         
         Polymarket markets use the window END time as the timestamp.
         Example: btc-updown-15m-1767161700 resolves at Unix time 1767161700
@@ -349,8 +395,43 @@ class MarketDiscovery:
         """
         now = int(time.time())
         
+        # Calculate current window end (round up to next boundary)
+        current_window_end = ((now // interval_seconds) + 1) * interval_seconds
+        
+        return [
+            current_window_end,                          # Current window
+            current_window_end + interval_seconds,       # Next window
+            current_window_end - interval_seconds,       # Previous window
+            current_window_end + (2 * interval_seconds), # Two ahead
+        ]
+    
+    def _get_current_window_timestamps(self) -> list[int]:
+        """
+        Get timestamps for current and upcoming windows (both 15-min and hourly).
+        
+        Polymarket markets use the window END time as the timestamp.
+        Example: btc-updown-15m-1767161700 resolves at Unix time 1767161700
+        
+        Returns list of possible window end timestamps to try.
+        """
+        # Get 15-minute window timestamps
+        timestamps_15m = self._get_window_timestamps_for_interval(self.INTERVAL_15M)
+        
+        # Get hourly window timestamps if enabled
+        if self.include_hourly:
+            timestamps_1h = self._get_window_timestamps_for_interval(self.INTERVAL_1H)
+            # Combine and deduplicate (some timestamps may overlap)
+            all_timestamps = list(set(timestamps_15m + timestamps_1h))
+            all_timestamps.sort()
+            return all_timestamps
+        
+        return timestamps_15m
+    
+    def _get_current_window_timestamps_legacy(self) -> list[int]:
+        """Legacy method for backwards compatibility."""
+        now = int(time.time())
+        
         # Calculate current window end (round up to next 15-min boundary)
-        # Example: if now=1767161500, current_window_end=1767161700
         current_window_end = ((now // self.INTERVAL_SECONDS) + 1) * self.INTERVAL_SECONDS
         
         # Try multiple windows to handle timing edge cases
@@ -379,21 +460,31 @@ class MarketDiscovery:
         Generate possible market slugs based on current time and asset.
         
         Format: {slug_pattern}-{unix_timestamp}
-        Example: btc-updown-15m-1767161700
+        Example: btc-updown-15m-1767161700, btc-updown-1h-1767164400
+        
+        Pairs 15m slugs with 15m timestamps and 1h slugs with 1h timestamps.
         """
-        timestamps = self._get_current_window_timestamps()
         slugs = []
         
-        # Prioritize current window with primary slug format
-        for ts in timestamps:
-            for slug_base in self._patterns["slugs"]:
+        # Generate 15-minute market slugs
+        timestamps_15m = self._get_window_timestamps_for_interval(self.INTERVAL_15M)
+        for ts in timestamps_15m:
+            for slug_base in self._patterns.get("slugs_15m", []):
                 slugs.append(f"{slug_base}-{ts}")
+        
+        # Generate hourly market slugs (if enabled)
+        if self.include_hourly:
+            timestamps_1h = self._get_window_timestamps_for_interval(self.INTERVAL_1H)
+            for ts in timestamps_1h:
+                for slug_base in self._patterns.get("slugs_1h", []):
+                    slugs.append(f"{slug_base}-{ts}")
         
         self.logger.debug(
             "Generated market slugs",
             asset=self.asset,
             slug_count=len(slugs),
-            first_slugs=slugs[:3],  # Show first 3 (primary format for each timestamp)
+            includes_hourly=self.include_hourly,
+            first_slugs=slugs[:4],
         )
         
         return slugs
@@ -595,7 +686,7 @@ class MarketDiscovery:
     
     async def _search_events_fallback(self, client: httpx.AsyncClient) -> list[DiscoveredMarket]:
         """
-        Fallback: Search events API for 15-minute crypto markets.
+        Fallback: Search events API for 15-minute and hourly crypto markets.
         
         Uses tag_id if available, otherwise searches by keywords.
         API: GET https://gamma-api.polymarket.com/events?active=true&tag_id=235
@@ -611,6 +702,7 @@ class MarketDiscovery:
             asset=self.asset,
             tag_id=tag_id,
             keywords=keywords,
+            include_hourly=self.include_hourly,
         )
         
         try:
@@ -643,7 +735,16 @@ class MarketDiscovery:
                         "up-or-down-15m" in slug
                     )
                     
-                    if not is_15min_market:
+                    # Look for hourly markets (if enabled)
+                    is_hourly_market = self.include_hourly and (
+                        ("1" in title and "hour" in title) or
+                        ("hourly" in title) or
+                        "updown-1h" in slug or
+                        "up-or-down-1h" in slug or
+                        "updown-hourly" in slug
+                    )
+                    
+                    if not (is_15min_market or is_hourly_market):
                         continue
                     
                     # Check if title/slug contains any of our asset keywords
