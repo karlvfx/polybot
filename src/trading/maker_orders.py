@@ -91,6 +91,7 @@ class MakerOrderExecutor:
     # Maker order configuration
     MAKER_TIMEOUT_SECONDS = 3.5  # Max wait for fill (edge decays quickly)
     TICK_SIZE = "0.01"  # Polymarket minimum price increment (as string for API)
+    TICK_SIZE_FLOAT = 0.01  # Same as above but as float for math operations
     NEG_RISK = False    # Standard YES/NO tokens
     MIN_SPREAD_FOR_MAKER = 0.02  # 2% minimum spread to place inside
     
@@ -203,12 +204,12 @@ class MakerOrderExecutor:
         
         if side == "BUY":
             # Step inside ask by 1 tick
-            maker_price = best_ask - self.TICK_SIZE
+            maker_price = best_ask - self.TICK_SIZE_FLOAT
             # Don't pay more than target
             maker_price = min(maker_price, target_price)
         else:  # SELL
             # Step inside bid by 1 tick
-            maker_price = best_bid + self.TICK_SIZE
+            maker_price = best_bid + self.TICK_SIZE_FLOAT
             # Don't sell for less than target
             maker_price = max(maker_price, target_price)
         

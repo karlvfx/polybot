@@ -5,6 +5,17 @@ This bot exploits the delay between real-time crypto spot prices
 and Chainlink oracle updates on Polymarket's 15-minute up/down markets.
 """
 
+# Force IPv4 to avoid Cloudflare blocks on some VPS IPv6 addresses
+import socket
+_original_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(*args, **kwargs):
+    """Monkey-patch to force IPv4 (some VPS IPv6 is blocked by Cloudflare)."""
+    responses = _original_getaddrinfo(*args, **kwargs)
+    # Filter to only IPv4 (AF_INET)
+    ipv4_responses = [r for r in responses if r[0] == socket.AF_INET]
+    return ipv4_responses if ipv4_responses else responses
+socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 import asyncio
 import signal
 import sys
