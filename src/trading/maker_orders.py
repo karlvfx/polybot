@@ -19,9 +19,18 @@ import structlog
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, PartialCreateOrderOptions
+    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
     from py_clob_client.order_builder.constants import BUY, SELL
     PY_CLOB_AVAILABLE = True
+    
+    # PartialCreateOrderOptions may not exist in all versions
+    try:
+        from py_clob_client.clob_types import PartialCreateOrderOptions
+        PARTIAL_OPTIONS_AVAILABLE = True
+    except ImportError:
+        PartialCreateOrderOptions = None
+        PARTIAL_OPTIONS_AVAILABLE = False
+        
 except ImportError:
     PY_CLOB_AVAILABLE = False
     ClobClient = None
@@ -29,6 +38,7 @@ except ImportError:
     OrderType = None
     MarketOrderArgs = None
     PartialCreateOrderOptions = None
+    PARTIAL_OPTIONS_AVAILABLE = False
     BUY = SELL = None
 
 from config.settings import settings
@@ -138,22 +148,36 @@ class MakerOrderExecutor:
             return False
     
     def _get_tick_size(self, token_id: str) -> str:
-        """Get tick size for a token (cached)."""
-        if token_id in self._tick_size_cache:
-            return self._tick_size_cache[token_id]
+        """
+        Get tick size for a token - ALWAYS fetch fresh to avoid stale cache issues.
         
-        # Try to fetch from API
+        py-clob-client has a known bug where cached tick sizes become stale
+        when markets become one-sided. Always fetch fresh from API.
+        """
         try:
-            # Get market info for this token
+            # Method 1: Try get_market endpoint
             market = self._client.get_market(token_id)
-            if isinstance(market, dict) and "minimum_tick_size" in market:
-                tick_size = market["minimum_tick_size"]
-                self._tick_size_cache[token_id] = tick_size
-                return tick_size
-        except Exception:
-            pass
+            if isinstance(market, dict):
+                # Try different possible field names
+                for field in ["minimum_tick_size", "tick_size", "tickSize"]:
+                    if field in market:
+                        tick_size = str(market[field])
+                        self.logger.debug(f"Got tick_size from API: {tick_size}")
+                        return tick_size
+        except Exception as e:
+            self.logger.debug(f"get_market failed: {e}")
         
-        # Default to standard Polymarket tick size
+        try:
+            # Method 2: Try get_tick_size if available
+            if hasattr(self._client, 'get_tick_size'):
+                tick_size = self._client.get_tick_size(token_id)
+                if tick_size:
+                    return str(tick_size)
+        except Exception as e:
+            self.logger.debug(f"get_tick_size failed: {e}")
+        
+        # Default to standard Polymarket tick size (0.01 = 1 cent)
+        self.logger.debug(f"Using default tick_size: {self.TICK_SIZE}")
         return self.TICK_SIZE
     
     def _calculate_maker_price(
@@ -243,7 +267,7 @@ class MakerOrderExecutor:
             # Polymarket uses tick_size=0.01 and neg_risk=False for standard YES/NO tokens
             order_side = BUY if side == "BUY" else SELL
             
-            # Get tick size for this token
+            # Get fresh tick size from API (avoid stale cache issues)
             tick_size = self._get_tick_size(token_id)
             
             # Build order args
@@ -254,19 +278,45 @@ class MakerOrderExecutor:
                 side=order_side,
             )
             
-            # Create options with explicit tick_size
-            options = PartialCreateOrderOptions(
-                tick_size=tick_size,
-                neg_risk=self.NEG_RISK,
-            )
+            # Create and post order - try multiple methods for compatibility
+            order = None
+            last_error = None
             
-            # Create and post order
-            try:
-                signed_order = self._client.create_order(order_args, options)
-                order = self._client.post_order(signed_order, OrderType.GTC)
-            except Exception as e:
-                self.logger.error(f"Order creation failed: {e}")
-                raise e
+            # Method 1: Use PartialCreateOrderOptions if available
+            if PARTIAL_OPTIONS_AVAILABLE and PartialCreateOrderOptions:
+                try:
+                    options = PartialCreateOrderOptions(
+                        tick_size=tick_size,
+                        neg_risk=self.NEG_RISK,
+                    )
+                    signed_order = self._client.create_order(order_args, options)
+                    order = self._client.post_order(signed_order, OrderType.GTC)
+                    self.logger.debug("Order created with PartialCreateOrderOptions")
+                except Exception as e:
+                    last_error = e
+                    self.logger.debug(f"PartialCreateOrderOptions failed: {e}")
+            
+            # Method 2: Try create_and_post_order (simpler API)
+            if order is None:
+                try:
+                    order = self._client.create_and_post_order(order_args, OrderType.GTC)
+                    self.logger.debug("Order created with create_and_post_order")
+                except Exception as e:
+                    last_error = e
+                    self.logger.debug(f"create_and_post_order failed: {e}")
+            
+            # Method 3: Try with dict-based order creation
+            if order is None:
+                try:
+                    signed_order = self._client.create_order(order_args)
+                    order = self._client.post_order(signed_order, OrderType.GTC)
+                    self.logger.debug("Order created with simple create_order")
+                except Exception as e:
+                    last_error = e
+                    self.logger.debug(f"Simple create_order failed: {e}")
+            
+            if order is None:
+                raise last_error or Exception("All order creation methods failed")
             
             order_id = order.get("orderID") or order.get("order_id")
             
