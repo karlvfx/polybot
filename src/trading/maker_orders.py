@@ -19,7 +19,7 @@ import structlog
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
     from py_clob_client.order_builder.constants import BUY, SELL
     PY_CLOB_AVAILABLE = True
 except ImportError:
@@ -27,6 +27,7 @@ except ImportError:
     ClobClient = None
     OrderArgs = None
     OrderType = None
+    MarketOrderArgs = None
     BUY = SELL = None
 
 from config.settings import settings
@@ -215,18 +216,36 @@ class MakerOrderExecutor:
             )
             
             # Build order args
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=maker_price,
-                size=size,
-                side=BUY if side == "BUY" else SELL,
-            )
+            # Polymarket uses tick_size=0.01 and neg_risk=False for standard YES/NO tokens
+            order_side = BUY if side == "BUY" else SELL
             
-            # Place order with post_only=True (CRITICAL: prevents taker fill)
-            order = self._client.create_and_post_order(
-                order_args,
-                OrderType.GTC,  # Good-til-cancelled
-            )
+            # Use create_order with explicit parameters to handle tick_size
+            try:
+                # Try the simple approach first
+                signed_order = self._client.create_order({
+                    "token_id": token_id,
+                    "price": maker_price,
+                    "size": size,
+                    "side": order_side,
+                    "fee_rate_bps": 0,  # Maker = 0 fees
+                    "nonce": 0,
+                    "expiration": 0,  # No expiration
+                })
+                order = self._client.post_order(signed_order, OrderType.GTC)
+            except Exception as e1:
+                self.logger.debug(f"Simple order failed: {e1}, trying OrderArgs")
+                # Fallback to OrderArgs
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=maker_price,
+                    size=size,
+                    side=order_side,
+                )
+                try:
+                    order = self._client.create_and_post_order(order_args, OrderType.GTC)
+                except Exception as e2:
+                    self.logger.error(f"OrderArgs also failed: {e2}")
+                    raise e2
             
             order_id = order.get("orderID") or order.get("order_id")
             
