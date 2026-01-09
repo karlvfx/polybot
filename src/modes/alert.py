@@ -284,14 +284,34 @@ class AlertMode(BaseMode):
         # REAL TRADING (if enabled)
         # ======================================================================
         real_position_opened = False
+        
+        # Debug: Log real trading state
+        self.logger.debug(
+            "Real trading check",
+            enabled=self._real_trading_enabled,
+            trader_exists=self._real_trader is not None,
+            asset=asset,
+        )
+        
         if self._real_trading_enabled and self._real_trader:
             # Safety checks
             can_trade = self._check_real_trading_limits()
+            self.logger.info(
+                "🔴 Real trade attempt",
+                asset=asset,
+                can_trade=can_trade,
+                direction=signal.direction.value,
+            )
             
             if can_trade:
                 try:
                     pm_data = signal.polymarket
                     if pm_data and pm_data.yes_ask > 0:
+                        self.logger.info(
+                            "🔴 Calling real_trader.open_position",
+                            asset=asset,
+                            yes_ask=pm_data.yes_ask,
+                        )
                         real_position = await self._real_trader.open_position(
                             signal=signal,
                             pm_data=pm_data,
@@ -307,8 +327,24 @@ class AlertMode(BaseMode):
                                 entry_price=f"${real_position.entry_price:.3f}",
                                 size=f"€{real_position.size_eur:.2f}",
                             )
+                        else:
+                            self.logger.warning(
+                                "🔴 Real position returned None (maker order not filled)",
+                                asset=asset,
+                            )
+                    else:
+                        self.logger.warning(
+                            "🔴 Skipping real trade - no PM data or invalid ask",
+                            has_pm_data=pm_data is not None,
+                            yes_ask=pm_data.yes_ask if pm_data else None,
+                        )
                 except Exception as e:
                     self.logger.error("Failed to open real position", error=str(e), exc_info=True)
+        else:
+            if not self._real_trading_enabled:
+                self.logger.debug("Real trading disabled")
+            elif not self._real_trader:
+                self.logger.warning("Real trader not initialized yet")
         
         # ======================================================================
         # VIRTUAL TRADING (always runs alongside real for tracking)
