@@ -125,7 +125,26 @@ class AdvancedRunner:
             "✅ Advanced strategy initialized",
             assets=list(self.feeds.keys()),
         )
+        
         return True
+    
+    async def _send_startup_message(self) -> None:
+        """Send startup message to Discord (with retry)."""
+        if not self.discord:
+            return
+        
+        for attempt in range(3):
+            try:
+                await self.discord.send_message(
+                    "🚀 **Advanced Maker Arb Bot Started**\n"
+                    f"• Mode: {'🧪 VIRTUAL' if self.virtual_mode else '💰 REAL'}\n"
+                    f"• Capital: ${self.capital:.2f}\n"
+                    f"• Assets: {', '.join(self.assets)}\n"
+                    f"• Strategies: Sniper (1h) + Maker (15m)"
+                )
+                return
+            except Exception:
+                await asyncio.sleep(2)
     
     async def _init_asset_feeds(self, asset: str) -> None:
         """Initialize feeds for a single asset."""
@@ -174,6 +193,9 @@ class AdvancedRunner:
         
         # Wait for feeds to connect
         await asyncio.sleep(5)
+        
+        # Send startup message to Discord
+        await self._send_startup_message()
         
         # Start strategy
         await self.strategy.start()
@@ -290,13 +312,18 @@ class AdvancedRunner:
         self._running = False
         self._shutdown_event.set()
         
-        # Send final summary to Discord
-        if self.strategy and self.discord:
+        # Send shutdown message and final summary to Discord
+        if self.discord:
             try:
-                summary = self.strategy.get_summary()
-                await self.discord.send_maker_arb_daily_summary(summary)
+                # Quick shutdown notification first
+                await self.discord.send_message("🛑 **Bot Shutting Down...**")
+                
+                # Then detailed summary
+                if self.strategy:
+                    summary = self.strategy.get_summary()
+                    await self.discord.send_maker_arb_daily_summary(summary)
             except Exception as e:
-                self.logger.debug("Failed to send final Discord summary", error=str(e))
+                self.logger.debug("Failed to send Discord shutdown", error=str(e))
         
         if self.strategy:
             await self.strategy.stop()
