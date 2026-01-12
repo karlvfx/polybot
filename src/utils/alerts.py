@@ -741,6 +741,241 @@ class DiscordAlerter:
         return await self.send_embed(embed)
     
     # ==========================================================================
+    # Advanced Maker Arb Alerts (Post-Jan 2026)
+    # ==========================================================================
+    
+    async def send_maker_arb_opportunity(
+        self,
+        log,  # VirtualTradeLog from advanced_maker_arb
+    ) -> bool:
+        """
+        Send alert when Advanced Maker Arb detects an opportunity.
+        
+        Supports all strategy types:
+        - sniper: Fee-free 1h/daily markets
+        - extreme_sniper: Low-fee extreme prices
+        - maker_dual: Rebate earning on 15m markets
+        """
+        # Strategy-specific styling
+        strategy_config = {
+            "sniper": {
+                "emoji": "🎯",
+                "title": "SNIPER OPPORTUNITY",
+                "color": 0x00FF00,  # Green
+                "desc": "Fee-free market detected!",
+            },
+            "extreme_sniper": {
+                "emoji": "⚡",
+                "title": "EXTREME SNIPER",
+                "color": 0xFFD700,  # Gold
+                "desc": f"Low-fee extreme price (fee: {log.dynamic_fee_pct:.2%})",
+            },
+            "maker_dual": {
+                "emoji": "🏦",
+                "title": "MAKER DUAL ENTRY",
+                "color": 0x3498DB,  # Blue
+                "desc": f"Rebate opportunity (est: ${log.maker_rebate_est:.2f}/day)",
+            },
+        }
+        
+        config = strategy_config.get(log.strategy, {
+            "emoji": "💰",
+            "title": "OPPORTUNITY",
+            "color": 0x808080,
+            "desc": "",
+        })
+        
+        # Fill type styling
+        fill_emojis = {
+            "both": "✅✅",
+            "yes_only": "✅❌",
+            "no_only": "❌✅",
+            "none": "❌❌",
+        }
+        fill_display = fill_emojis.get(log.fill_type, "❓")
+        
+        # P&L color
+        pnl_color = "🟢" if log.net_virtual_pnl > 0 else "🔴" if log.net_virtual_pnl < 0 else "⚪"
+        
+        embed = {
+            "title": f"{config['emoji']} {config['title']}",
+            "description": config['desc'],
+            "color": config['color'],
+            "fields": [
+                {
+                    "name": "📊 Market Info",
+                    "value": (
+                        f"**Asset:** {log.asset}\n"
+                        f"**Market Type:** {log.market_type.upper()}\n"
+                        f"**Strategy:** {log.strategy.replace('_', ' ').title()}"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "💰 Prices",
+                    "value": (
+                        f"**YES:** ${log.yes_price:.3f}\n"
+                        f"**NO:** ${log.no_price:.3f}\n"
+                        f"**Combined:** ${log.combined_cost:.3f}"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "📈 Opportunity",
+                    "value": (
+                        f"**Gap:** {log.potential_gap_pct:.2%}\n"
+                        f"**Fee:** {log.dynamic_fee_pct:.2%}\n"
+                        f"**Net P&L:** {pnl_color} ${log.net_virtual_pnl:.2f}"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "🎲 Simulated Execution",
+                    "value": (
+                        f"**Fill Status:** {fill_display}\n"
+                        f"**Rebate Est:** ${log.maker_rebate_est:.2f}/day\n"
+                        f"**Rebate Mult:** {log.rebate_multiplier:.0%}"
+                    ),
+                    "inline": True,
+                },
+            ],
+            "footer": {
+                "text": f"Virtual Mode | {log.notes[:50]}..." if len(log.notes) > 50 else f"Virtual Mode | {log.notes}",
+            },
+            "timestamp": log.timestamp.isoformat(),
+        }
+        
+        return await self.send_embed(embed)
+    
+    async def send_maker_arb_daily_summary(
+        self,
+        summary: dict,
+        daily_stats: list = None,
+    ) -> bool:
+        """
+        Send daily summary for Advanced Maker Arb strategy.
+        """
+        total_pnl = float(summary.get("total_virtual_pnl", "$0").replace("$", ""))
+        
+        # Color based on P&L
+        if total_pnl > 10:
+            color = 0x00FF00  # Green
+            emoji = "🚀"
+        elif total_pnl > 0:
+            color = 0x90EE90  # Light green
+            emoji = "📈"
+        elif total_pnl == 0:
+            color = 0x808080  # Gray
+            emoji = "➖"
+        else:
+            color = 0xFF0000  # Red
+            emoji = "📉"
+        
+        embed = {
+            "title": f"{emoji} Advanced Maker Arb - Daily Summary",
+            "color": color,
+            "fields": [
+                {
+                    "name": "📊 Opportunities",
+                    "value": (
+                        f"**Total:** {summary.get('total_opportunities', 0)}\n"
+                        f"**Sniper:** {summary.get('sniper_opportunities', 0)}\n"
+                        f"**Maker:** {summary.get('maker_opportunities', 0)}"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "💰 Virtual P&L",
+                    "value": (
+                        f"**Total:** {summary.get('total_virtual_pnl', '$0')}\n"
+                        f"**Sniper P&L:** {summary.get('sniper_pnl', '$0')}\n"
+                        f"**Maker P&L:** {summary.get('maker_pnl', '$0')}"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "📅 Tracking",
+                    "value": (
+                        f"**Days:** {summary.get('days_tracked', 0)}\n"
+                        f"**Avg Daily:** {summary.get('avg_daily_pnl', '$0')}"
+                    ),
+                    "inline": True,
+                },
+            ],
+            "footer": {
+                "text": "Virtual Mode - No real money at risk",
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
+        # Add strategy breakdown
+        embed["fields"].append({
+            "name": "🎯 Strategy Performance",
+            "value": (
+                "```\n"
+                f"{'Strategy':<15} {'Opps':>6} {'P&L':>10}\n"
+                f"{'-'*33}\n"
+                f"{'Sniper':<15} {summary.get('sniper_opportunities', 0):>6} {summary.get('sniper_pnl', '$0'):>10}\n"
+                f"{'Extreme Sniper':<15} {'N/A':>6} {'N/A':>10}\n"
+                f"{'Maker Dual':<15} {summary.get('maker_opportunities', 0):>6} {summary.get('maker_pnl', '$0'):>10}\n"
+                "```"
+            ),
+            "inline": False,
+        })
+        
+        return await self.send_embed(embed)
+    
+    async def send_fee_structure_alert(
+        self,
+        market_type: str,
+        base_fee: float,
+        dynamic_fee: float,
+        is_fee_free: bool,
+    ) -> bool:
+        """
+        Send alert about fee structure for educational purposes.
+        """
+        if is_fee_free:
+            color = 0x00FF00
+            emoji = "🆓"
+            title = "FEE-FREE MARKET DETECTED"
+        elif dynamic_fee < 0.01:
+            color = 0xFFD700
+            emoji = "⚡"
+            title = "LOW-FEE OPPORTUNITY"
+        else:
+            color = 0xFF6600
+            emoji = "💸"
+            title = "STANDARD FEE MARKET"
+        
+        embed = {
+            "title": f"{emoji} {title}",
+            "color": color,
+            "fields": [
+                {
+                    "name": "Market Type",
+                    "value": market_type.upper(),
+                    "inline": True,
+                },
+                {
+                    "name": "Base Fee",
+                    "value": f"{base_fee:.2%}",
+                    "inline": True,
+                },
+                {
+                    "name": "Dynamic Fee",
+                    "value": f"{dynamic_fee:.2%}",
+                    "inline": True,
+                },
+            ],
+            "footer": {
+                "text": "Post-Jan 2026 Fee Structure | 1h/Daily = 0% | 15m = Dynamic",
+            },
+        }
+        
+        return await self.send_embed(embed)
+    
+    # ==========================================================================
     # Helper Methods
     # ==========================================================================
     

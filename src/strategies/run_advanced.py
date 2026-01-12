@@ -40,6 +40,7 @@ from src.feeds.kraken import KrakenFeed
 from src.feeds.polymarket import PolymarketFeed
 from src.engine.consensus import ConsensusEngine
 from src.strategies.advanced_maker_arb import AdvancedMakerArb
+from src.utils.alerts import DiscordAlerter
 from config.settings import settings
 
 
@@ -72,6 +73,9 @@ class AdvancedRunner:
         # Strategy
         self.strategy: AdvancedMakerArb = None
         
+        # Discord alerter
+        self.discord: DiscordAlerter = None
+        
         # Control
         self._running = False
         self._shutdown_event = asyncio.Event()
@@ -86,10 +90,19 @@ class AdvancedRunner:
             assets=self.assets,
         )
         
+        # Initialize Discord alerter
+        discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
+        if discord_webhook:
+            self.discord = DiscordAlerter(discord_webhook)
+            self.logger.info("✅ Discord alerter initialized")
+        else:
+            self.logger.warning("⚠️ No DISCORD_WEBHOOK_URL - alerts disabled")
+        
         # Initialize strategy
         self.strategy = AdvancedMakerArb(
             virtual_mode=self.virtual_mode,
             capital_usd=self.capital,
+            discord_alerter=self.discord,
         )
         
         self.strategy.set_callbacks(
@@ -257,8 +270,20 @@ class AdvancedRunner:
         self._running = False
         self._shutdown_event.set()
         
+        # Send final summary to Discord
+        if self.strategy and self.discord:
+            try:
+                summary = self.strategy.get_summary()
+                await self.discord.send_maker_arb_daily_summary(summary)
+            except Exception as e:
+                self.logger.debug("Failed to send final Discord summary", error=str(e))
+        
         if self.strategy:
             await self.strategy.stop()
+        
+        # Close Discord client
+        if self.discord:
+            await self.discord.close()
         
         for asset, feeds in self.feeds.items():
             for name, feed in feeds.items():

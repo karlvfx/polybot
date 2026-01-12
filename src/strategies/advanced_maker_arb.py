@@ -31,6 +31,7 @@ from uuid import uuid4
 import structlog
 
 from src.models.schemas import ConsensusData, PolymarketData
+from src.utils.alerts import DiscordAlerter
 
 logger = structlog.get_logger()
 
@@ -155,12 +156,16 @@ class AdvancedMakerArb:
         log_dir: str = "logs/maker_arb",
         simulate_latency: bool = True,  # Add realistic delays
         simulate_fill_probability: bool = True,  # Simulate partial fills
+        discord_alerter: Optional[DiscordAlerter] = None,  # Discord notifications
     ):
         self.logger = logger.bind(component="advanced_maker_arb")
         self._virtual_mode = virtual_mode
         self._capital_usd = capital_usd
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Discord alerter for notifications
+        self._discord = discord_alerter
         
         # Realism settings for accurate virtual testing
         self._simulate_latency = simulate_latency
@@ -589,7 +594,7 @@ class AdvancedMakerArb:
         log = self._simulate_execution(log)
         
         self._trade_logs.append(log)
-        
+
         # Update daily stats
         date_key = log.timestamp.strftime("%Y-%m-%d")
         if date_key not in self._daily_stats:
@@ -612,11 +617,24 @@ class AdvancedMakerArb:
             gap=f"{log.potential_gap_pct:.2%}",
             fee=f"{log.dynamic_fee_pct:.2%}",
             net_pnl=f"${log.net_virtual_pnl:.2f}",
+            fill_type=log.fill_type,
             notes=log.notes,
         )
         
+        # Send Discord alert (non-blocking)
+        if self._discord:
+            import asyncio
+            asyncio.create_task(self._send_discord_alert(log))
+        
         if self._on_opportunity:
             self._on_opportunity(log)
+    
+    async def _send_discord_alert(self, log: VirtualTradeLog) -> None:
+        """Send Discord alert for opportunity (non-blocking)."""
+        try:
+            await self._discord.send_maker_arb_opportunity(log)
+        except Exception as e:
+            self.logger.debug("Discord alert failed", error=str(e))
     
     async def _export_trade_logs(self) -> None:
         """Export trade logs to CSV for analysis."""
