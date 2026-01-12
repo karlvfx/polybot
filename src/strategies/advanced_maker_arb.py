@@ -141,9 +141,9 @@ class AdvancedMakerArb:
     BASE_FEE_DAILY = 0.0  # Zero fees on daily markets
     
     # Thresholds
-    MIN_ARB_GAP_PCT = 0.02  # 2% minimum gap for sniper
+    MIN_ARB_GAP_PCT = 0.005  # 0.5% minimum gap for sniper (lowered for virtual testing)
     MIN_DISCOUNT_PCT = 0.03  # 3% discount for maker dual-entry
-    EXTREME_PRICE_THRESHOLD = 0.15  # <$0.15 or >$0.85 = low fees
+    EXTREME_PRICE_THRESHOLD = 0.25  # <$0.25 or >$0.75 = low fees (widened for testing)
     
     # Position sizing
     MAX_POSITION_USD = 50.0
@@ -346,6 +346,26 @@ class AdvancedMakerArb:
         combined_cost = yes_price + no_price
         
         dynamic_fee = self.calculate_dynamic_fee(yes_price, market_type)
+        
+        # Log every scan so we can see what's happening
+        gap = 1.0 - combined_cost
+        is_extreme = self.is_extreme_price(yes_price) or self.is_extreme_price(no_price)
+        
+        # Log scans periodically (every 30 seconds per asset)
+        scan_key = f"{asset}_last_log"
+        now = time.time()
+        last_log = getattr(self, scan_key, 0)
+        if now - last_log > 30:
+            setattr(self, scan_key, now)
+            self.logger.info(
+                f"📊 SCAN: {asset}",
+                yes=f"${yes_price:.3f}",
+                no=f"${no_price:.3f}",
+                combined=f"${combined_cost:.3f}",
+                gap=f"{gap:.2%}",
+                fee=f"{dynamic_fee:.2%}",
+                extreme=is_extreme,
+            )
         
         # Create base log entry
         log = VirtualTradeLog(
