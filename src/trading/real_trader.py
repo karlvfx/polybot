@@ -165,11 +165,15 @@ class RealTrader:
         signal: SignalCandidate,
         pm_data: PolymarketData,
         asset: str = "BTC",
+        aggressive: bool = False,
     ) -> Optional[RealPosition]:
         """
-        Open a real position using maker-only order.
+        Open a real position.
         
-        Returns None if order doesn't fill (we don't chase with taker).
+        Args:
+            aggressive: If True, use taker pricing for instant fill
+        
+        Returns None if order doesn't fill.
         """
         if not self._initialized:
             self.logger.error("Trader not initialized")
@@ -213,7 +217,7 @@ class RealTrader:
             target_price=f"${entry_price:.3f}",
         )
         
-        # Execute maker order
+        # Execute order (aggressive = instant taker, normal = maker with timeout)
         result = await self._executor.place_maker_order(
             token_id=token_id,
             side=side,
@@ -221,6 +225,7 @@ class RealTrader:
             target_price=entry_price,
             best_bid=pm_data.yes_bid if position.direction == "UP" else pm_data.no_bid,
             best_ask=pm_data.yes_ask if position.direction == "UP" else pm_data.no_ask,
+            aggressive=aggressive,
         )
         
         if result.success:
@@ -284,6 +289,10 @@ class RealTrader:
     async def _monitor_position(self, position: RealPosition) -> None:
         """Monitor position and close when exit conditions met."""
         
+        # Brief settlement wait - settlement check handles any issues
+        SETTLEMENT_DELAY_SECONDS = 2.0
+        await asyncio.sleep(SETTLEMENT_DELAY_SECONDS)
+        
         # Get asset-specific settings
         asset_config = settings.asset_configs.get(position.asset)
         time_limit = asset_config.time_limit_s or 90
@@ -303,6 +312,21 @@ class RealTrader:
                     current_price = pm_data.yes_bid
                 else:
                     current_price = pm_data.no_bid
+                
+                # If price is 0/invalid, market might be settling - check settlement
+                if current_price < 0.01:
+                    self.logger.debug(
+                        "Market bid is 0 - checking if settled",
+                        position_id=position.position_id,
+                        direction=position.direction,
+                    )
+                    # Check if market has settled
+                    settled = await self._check_if_market_settled(position)
+                    if settled:
+                        break
+                    # Otherwise wait for valid price data
+                    await asyncio.sleep(1)
+                    continue
                 
                 # Calculate P&L
                 pnl_pct = (current_price - position.entry_price) / position.entry_price
@@ -328,10 +352,20 @@ class RealTrader:
                     exit_reason = "liquidity_collapse"
                 
                 if exit_reason:
-                    await self._close_position(position, current_price, exit_reason)
-                    break
+                    closed = await self._close_position(position, current_price, exit_reason)
+                    if closed:
+                        break
+                    else:
+                        # Exit failed - wait longer before retrying
+                        self.logger.warning(
+                            "Exit failed, will retry on next cycle",
+                            position_id=position.position_id,
+                            exit_reason=exit_reason,
+                        )
+                        await asyncio.sleep(1.0)  # Quick retry
+                        continue
                 
-                await asyncio.sleep(0.5)  # Check every 500ms
+                await asyncio.sleep(0.1)  # Check every 100ms - ultra fast
                 
             except asyncio.CancelledError:
                 break
@@ -339,19 +373,173 @@ class RealTrader:
                 self.logger.error("Error monitoring position", error=str(e))
                 await asyncio.sleep(1)
     
+    async def _check_if_market_settled(self, position: RealPosition) -> bool:
+        """
+        Check if the market has already settled (resolved).
+        
+        For 15-minute markets, they settle automatically after the period ends.
+        If settled:
+          - Winning position: shares were redeemed for $1 each (USDC credited)
+          - Losing position: shares are worthless (balance = 0)
+        
+        Returns True if market settled and position was handled.
+        """
+        try:
+            from py_clob_client.exceptions import PolyApiException
+            
+            market_exists = True
+            
+            # Try to get market info - if 404, market has definitely settled
+            try:
+                market = self._executor._client.get_market(position.token_id)
+                if not market:
+                    market_exists = False
+            except PolyApiException as e:
+                if '404' in str(e) or 'not found' in str(e).lower():
+                    market_exists = False
+                    self.logger.info(
+                        "Market not found - treating as settled",
+                        position_id=position.position_id,
+                    )
+            except Exception:
+                pass  # Continue to orderbook check
+            
+            # Also check orderbook - if 404 or empty, market has settled
+            try:
+                book = self._executor._client.get_order_book(position.token_id)
+                if book and (book.get('bids') or book.get('asks')):
+                    # Market still active with liquidity
+                    if market_exists:
+                        return False
+            except PolyApiException as e:
+                if '404' in str(e) or 'No orderbook' in str(e):
+                    market_exists = False
+            except Exception:
+                pass
+            
+            # If market still exists with liquidity, not settled yet
+            if market_exists:
+                return False
+            
+            # Market settled - check if we have shares (winning) or not (losing)
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            
+            balance_info = self._executor._client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=position.token_id,
+                )
+            )
+            balance = int(balance_info.get('balance', 0))
+            shares = balance / 1_000_000  # 6 decimals
+            
+            # Market settled - we can't determine win/loss from share balance alone
+            # Shares exist for both winners (worth $1) and losers (worth $0)
+            # For now, assume loss since we can't reliably check outcome
+            # The actual P&L will be reflected when shares are redeemed
+            
+            self.logger.warning(
+                "📊 Market settled - position closed",
+                position_id=position.position_id,
+                asset=position.asset,
+                shares=f"{shares:.2f}",
+                note="Actual P&L will be determined by redemption",
+            )
+            
+            # Mark as closed with UNKNOWN outcome (conservative: assume break-even)
+            position.is_closed = True
+            position.exit_price = position.entry_price  # Assume break-even until redeemed
+            position.exit_time_ms = int(time.time() * 1000)
+            position.exit_reason = "market_settled"
+            position.realized_pnl_eur = 0  # Will be updated when redeemed
+            
+            if False:  # Disabled - was incorrectly detecting wins
+                # No shares - we lost (or entry didn't fill)
+                entry_age_ms = int(time.time() * 1000) - (position.entry_time_ms or 0)
+                
+                if entry_age_ms < 30000:  # Entry less than 30s ago
+                    # Might just be settlement delay
+                    return False
+                
+                self.logger.info(
+                    "📉 Market settled - position closed",
+                    position_id=position.position_id,
+                    asset=position.asset,
+                    direction=position.direction,
+                    entry_price=f"${position.entry_price:.3f}",
+                    result="Loss or no fill",
+                )
+                
+                position.is_closed = True
+                position.exit_price = 0.0  # Loser gets $0
+                position.exit_time_ms = int(time.time() * 1000)
+                position.exit_reason = "market_settled_loss"
+                position.realized_pnl_eur = -position.size_eur
+            
+            # Update stats and move to closed
+            self.total_pnl += position.realized_pnl_eur
+            
+            if position in self.open_positions:
+                self.open_positions.remove(position)
+            self.closed_positions.append(position)
+            
+            if position.position_id in self._monitor_tasks:
+                del self._monitor_tasks[position.position_id]
+            
+            # Record in session tracker
+            session_tracker.record_trade_closed(
+                position_id=position.position_id,
+                asset=position.asset,
+                direction=position.direction,
+                entry_price=position.entry_price,
+                exit_price=position.exit_price,
+                exit_reason=position.exit_reason,
+                duration_seconds=position.duration_seconds,
+                gross_pnl_eur=position.realized_pnl_eur,
+                total_fees_eur=position.fees_paid_eur,
+                net_pnl_eur=position.realized_pnl_eur,
+            )
+            
+            # Trigger callback
+            if self._on_position_closed:
+                try:
+                    await self._on_position_closed(position)
+                except Exception as e:
+                    self.logger.error("Error in closed callback", error=str(e))
+            
+            return True
+            
+        except Exception as e:
+            self.logger.debug(f"Error checking settlement: {e}")
+            return False  # Continue with normal exit attempt
+    
     async def _close_position(
         self,
         position: RealPosition,
         exit_price: float,
         exit_reason: str,
-    ) -> None:
-        """Close a position with maker order for exit."""
+        retry_count: int = 0,
+    ) -> bool:
+        """
+        Close a position with maker order for exit.
+        
+        Returns True if successfully closed, False if exit failed.
+        Retries up to 3 times with escalating strategies.
+        """
+        MAX_RETRIES = 3
+        
+        # Check if market has settled (no orderbook = market closed)
+        # Check on EVERY retry since markets can settle mid-exit
+        market_settled = await self._check_if_market_settled(position)
+        if market_settled:
+            return True  # Position handled via settlement
         
         self.logger.info(
             "Closing position",
             position_id=position.position_id,
             exit_reason=exit_reason,
             exit_price=f"${exit_price:.3f}",
+            retry=retry_count,
         )
         
         # Place maker sell order
@@ -364,9 +552,80 @@ class RealTrader:
             best_ask=exit_price + 0.02,
         )
         
-        # Mark position as closed
+        # Check if exit order succeeded
+        if not result.success:
+            error_str = result.error or ""
+            is_balance_error = "not enough balance" in error_str.lower()
+            
+            self.logger.error(
+                "❌ EXIT ORDER FAILED - Position still open!",
+                position_id=position.position_id,
+                asset=position.asset,
+                error=result.error,
+                retry=retry_count,
+                is_balance_error=is_balance_error,
+            )
+            
+            # If "not enough balance" after all retries, we probably don't have the shares
+            # This means the entry didn't actually fill - mark position as orphaned
+            if is_balance_error and retry_count >= MAX_RETRIES:
+                self.logger.critical(
+                    "🚨 Position likely has no shares - entry may not have filled!",
+                    position_id=position.position_id,
+                    asset=position.asset,
+                    hint="Check Polymarket portfolio manually",
+                )
+                # Mark as closed with 100% loss (we spent gas but got nothing)
+                position.is_closed = True
+                position.exit_price = 0.0
+                position.exit_time_ms = int(time.time() * 1000)
+                position.exit_reason = "orphaned_no_shares"
+                position.realized_pnl_eur = -position.size_eur  # Full loss
+                
+                if position in self.open_positions:
+                    self.open_positions.remove(position)
+                self.closed_positions.append(position)
+                
+                if position.position_id in self._monitor_tasks:
+                    del self._monitor_tasks[position.position_id]
+                
+                return True  # "Closed" in the sense that we gave up
+            
+            # Retry with adjusted parameters
+            if retry_count < MAX_RETRIES:
+                # Quick retry - settlement check handles issues
+                await asyncio.sleep(0.5)
+                
+                # On retry, try slightly worse price to ensure fill
+                adjusted_price = exit_price - (0.01 * (retry_count + 1))
+                adjusted_price = max(adjusted_price, 0.01)  # Don't go below 1 cent
+                
+                self.logger.warning(
+                    "Retrying exit with adjusted price",
+                    position_id=position.position_id,
+                    original_price=f"${exit_price:.3f}",
+                    adjusted_price=f"${adjusted_price:.3f}",
+                )
+                
+                return await self._close_position(
+                    position, adjusted_price, exit_reason, retry_count + 1
+                )
+            else:
+                # All retries failed - log critical error but DON'T mark as closed
+                self.logger.critical(
+                    "🚨 CRITICAL: Failed to close position after all retries!",
+                    position_id=position.position_id,
+                    asset=position.asset,
+                    entry_price=f"${position.entry_price:.3f}",
+                    size_shares=position.size_shares,
+                    error=result.error,
+                )
+                # Position remains open - will continue monitoring
+                return False
+        
+        # Exit succeeded - now mark position as closed
         position.is_closed = True
-        position.exit_price = result.fill_price if result.success else exit_price
+        position.exit_price = result.fill_price or exit_price
         position.exit_time_ms = int(time.time() * 1000)
         position.exit_reason = exit_reason
         position.exit_order_id = result.order_id
@@ -375,7 +634,7 @@ class RealTrader:
         pnl_pct = (position.exit_price - position.entry_price) / position.entry_price
         gross_pnl = position.size_eur * pnl_pct
         
-        position.rebates_earned_eur += result.rebate_earned if result.success else 0
+        position.rebates_earned_eur += result.rebate_earned
         position.realized_pnl_eur = gross_pnl + position.rebates_earned_eur - position.fees_paid_eur
         
         # Update stats
@@ -423,6 +682,8 @@ class RealTrader:
                 await self._on_position_closed(position)
             except Exception as e:
                 self.logger.error("Error in closed callback", error=str(e))
+        
+        return True
     
     def get_stats(self) -> Dict[str, Any]:
         """Get trader statistics."""

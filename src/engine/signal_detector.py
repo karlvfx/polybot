@@ -63,6 +63,60 @@ def calculate_spot_implied_prob(momentum_velocity: float, scale: float = 100.0) 
     return 1 / (1 + math.exp(-momentum_velocity * scale))
 
 
+def calculate_window_implied_prob(
+    window_move_pct: float,
+    time_remaining_seconds: float,
+    total_window_seconds: float = 900.0,
+) -> float:
+    """
+    Calculate implied UP probability based on WINDOW POSITION, not 30s momentum.
+    
+    This is the CORRECT way to determine direction for 15-min markets:
+    - Market settles UP if: price_at_end >= price_at_start
+    - Market settles DOWN if: price_at_end < price_at_start
+    
+    Args:
+        window_move_pct: Current price move from window start (positive = up)
+        time_remaining_seconds: Seconds until window ends
+        total_window_seconds: Total window duration (900 for 15-min)
+    
+    Returns:
+        Implied probability of UP (0.0 to 1.0)
+        
+    Logic:
+        - If price is above window start with little time left → high UP probability
+        - If price is above window start with lots of time left → moderate UP probability
+        - If price is below window start → depends on time remaining
+    
+    Examples (with 15-min window):
+        - +0.5% above start, 1 min remaining → ~90% UP probability
+        - +0.5% above start, 7 min remaining → ~65% UP probability
+        - -0.3% below start, 1 min remaining → ~20% UP probability
+        - At exactly start price, any time → ~50% probability
+    """
+    if total_window_seconds <= 0:
+        return 0.5
+    
+    # Time factor: 0 = window just started, 1 = window about to end
+    time_factor = 1.0 - (time_remaining_seconds / total_window_seconds)
+    time_factor = max(0.0, min(1.0, time_factor))  # Clamp to [0, 1]
+    
+    # Base probability from current position
+    # Use sigmoid with scale that increases as time progresses
+    # Early in window: small moves don't matter much (low scale)
+    # Late in window: position matters a lot (high scale)
+    min_scale = 30.0   # Early window: gentle curve
+    max_scale = 200.0  # Late window: steep curve (small moves = certain outcome)
+    
+    # Scale increases exponentially as we approach window end
+    scale = min_scale + (max_scale - min_scale) * (time_factor ** 2)
+    
+    # Calculate probability using logistic function
+    prob = 1 / (1 + math.exp(-window_move_pct * scale))
+    
+    return prob
+
+
 class SignalDetector:
     """
     Detects trading signals based on spot-PM divergence.
@@ -111,6 +165,10 @@ class SignalDetector:
         """
         Calculate spot-PM divergence - the core signal.
         
+        UPDATED STRATEGY (Window-aware):
+        - Use current price vs WINDOW START price (not 30s momentum)
+        - This matches how 15-min markets actually settle
+        
         Args:
             consensus: Spot price data from exchanges
             pm_data: Polymarket orderbook data
@@ -122,35 +180,75 @@ class SignalDetector:
         # Get asset-specific settings
         asset_config = settings.asset_configs.get(asset)
         
-        # Get spot price momentum (30s move)
-        spot_move = consensus.move_30s_pct
+        # =======================================================================
+        # NEW: Window-aware probability calculation
+        # =======================================================================
+        # The 15-min market settles based on: price_at_end vs price_at_start
+        # We need to know where we are relative to WINDOW START, not 30s ago!
         
-        # Asset-specific sigmoid scale (ETH=130 for sensitivity, others=100)
-        scale = asset_config.spot_implied_scale or settings.signals.spot_implied_scale
+        now = int(time.time())
         
-        # Apply volatility scaling for ETH during calm periods
-        effective_spot_move = spot_move
-        if asset_config.volatility_scale_enabled and consensus.volatility_30s > 0:
-            base_volatility = 0.002  # 0.2% typical volatility
-            volatility_ratio = consensus.volatility_30s / base_volatility
+        # Check if we have window info from Polymarket data
+        window_start_price = pm_data.window_start_price
+        window_end_ts = pm_data.window_end_ts
+        
+        if window_start_price > 0 and window_end_ts > now:
+            # USE WINDOW-AWARE LOGIC (CORRECT!)
+            # Calculate window position
+            window_move_pct = (consensus.consensus_price - window_start_price) / window_start_price
+            time_remaining = window_end_ts - now
             
-            if volatility_ratio < 0.8:  # Calm period
-                # Boost sensitivity (makes smaller moves more significant)
-                scale_factor = asset_config.volatility_scale_factor or 1.0
-                effective_spot_move = spot_move * scale_factor
-                self.logger.debug(
-                    f"Volatility scaling applied for {asset}",
-                    original_move=f"{spot_move:.4%}",
-                    effective_move=f"{effective_spot_move:.4%}",
-                    volatility_ratio=f"{volatility_ratio:.2f}",
-                    scale_factor=scale_factor,
-                )
-        
-        # Calculate what spot move implies for UP probability
-        spot_implied = calculate_spot_implied_prob(
-            effective_spot_move,
-            scale=scale,
-        )
+            # Calculate implied UP probability based on window position + time
+            spot_implied = calculate_window_implied_prob(
+                window_move_pct,
+                time_remaining,
+                total_window_seconds=900.0,  # 15-min window
+            )
+            
+            self.logger.debug(
+                "Window-aware divergence calculation",
+                asset=asset,
+                window_start_price=f"${window_start_price:.2f}",
+                current_price=f"${consensus.consensus_price:.2f}",
+                window_move_pct=f"{window_move_pct:.3%}",
+                time_remaining=f"{time_remaining}s",
+                spot_implied=f"{spot_implied:.1%}",
+            )
+        else:
+            # FALLBACK: Use 30s momentum (LEGACY - less accurate)
+            spot_move = consensus.move_30s_pct
+            
+            # Asset-specific sigmoid scale (ETH=130 for sensitivity, others=100)
+            scale = asset_config.spot_implied_scale or settings.signals.spot_implied_scale
+            
+            # Apply volatility scaling for ETH during calm periods
+            effective_spot_move = spot_move
+            if asset_config.volatility_scale_enabled and consensus.volatility_30s > 0:
+                base_volatility = 0.002  # 0.2% typical volatility
+                volatility_ratio = consensus.volatility_30s / base_volatility
+                
+                if volatility_ratio < 0.8:  # Calm period
+                    scale_factor = asset_config.volatility_scale_factor or 1.0
+                    effective_spot_move = spot_move * scale_factor
+                    self.logger.debug(
+                        f"Volatility scaling applied for {asset}",
+                        original_move=f"{spot_move:.4%}",
+                        effective_move=f"{effective_spot_move:.4%}",
+                        volatility_ratio=f"{volatility_ratio:.2f}",
+                        scale_factor=scale_factor,
+                    )
+            
+            spot_implied = calculate_spot_implied_prob(
+                effective_spot_move,
+                scale=scale,
+            )
+            
+            self.logger.debug(
+                "⚠️ Fallback: Using 30s momentum (no window info)",
+                asset=asset,
+                spot_move=f"{spot_move:.3%}",
+                spot_implied=f"{spot_implied:.1%}",
+            )
         
         # PM implied probability (YES price = UP probability)
         pm_implied = pm_data.yes_bid  # Use bid price (what we'd pay to buy YES)
@@ -160,9 +258,9 @@ class SignalDetector:
         
         # Determine signal direction
         if spot_implied > pm_implied:
-            direction = "UP"  # Spot implies higher UP prob than PM shows
+            direction = "UP"  # Current position implies higher UP prob than PM shows
         else:
-            direction = "DOWN"  # Spot implies lower UP prob (so DOWN is mispriced)
+            direction = "DOWN"  # Current position implies lower UP prob (so DOWN is mispriced)
         
         # Get PM orderbook staleness
         pm_age = pm_data.orderbook_age_seconds

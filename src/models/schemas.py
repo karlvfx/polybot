@@ -215,10 +215,13 @@ class PolymarketData:
     depth_change_pct: float = 0.0  # How much depth changed while prices static
     
     # NEW: Fee tracking (Polymarket fee update Jan 2026)
-    yes_token_id: str = ""
-    no_token_id: str = ""
     yes_fee_rate_bps: int = 0  # e.g., 1000 = 0.1% base rate
     no_fee_rate_bps: int = 0
+    
+    # NEW: Window timing for 15-min markets (CRITICAL for direction logic)
+    window_start_ts: int = 0  # Unix timestamp of window start
+    window_end_ts: int = 0  # Unix timestamp of window end
+    window_start_price: float = 0.0  # Chainlink price at window start (for UP/DOWN determination)
     
     @property
     def yes_fee_pct(self) -> float:

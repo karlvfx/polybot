@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+Advanced Strategy Runner - Post Jan 2026 Edition.
+
+Runs the fee-aware Advanced Maker Arb strategy that:
+1. Snipes fee-free 1-hour markets (old strategy works!)
+2. Exploits low-fee extremes on 15-min markets
+3. Provides liquidity for rebates on mid-priced 15-min markets
+
+Usage:
+    python -m src.strategies.run_advanced
+
+Configuration via .env:
+    MAKER_CAPITAL=500.0
+    MAKER_VIRTUAL_MODE=true
+"""
+
+import asyncio
+import os
+import signal
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import structlog
+from src.utils.logging import setup_logging
+
+# Setup logging first
+setup_logging()
+logger = structlog.get_logger()
+
+from src.feeds.binance import BinanceFeed
+from src.feeds.coinbase import CoinbaseFeed
+from src.feeds.kraken import KrakenFeed
+from src.feeds.polymarket import PolymarketFeed
+from src.engine.consensus import ConsensusEngine
+from src.strategies.advanced_maker_arb import AdvancedMakerArb
+from config.settings import settings
+
+
+class AdvancedRunner:
+    """
+    Runs the Advanced Maker Arb strategy.
+    
+    Key features:
+    - Scans both 15-min AND 1-hour markets
+    - Fee-aware opportunity detection
+    - Virtual P&L tracking with CSV export
+    """
+    
+    def __init__(self):
+        self.logger = logger.bind(component="advanced_runner")
+        
+        # Configuration
+        self.capital = float(os.getenv("MAKER_CAPITAL", "500.0"))
+        self.virtual_mode = os.getenv("MAKER_VIRTUAL_MODE", "true").lower() == "true"
+        self.assets = ["ETH", "SOL"]  # Focus on these for now
+        
+        # Components
+        self.feeds: dict[str, dict] = {}
+        self.consensus_engines: dict[str, ConsensusEngine] = {}
+        
+        # Market feeds (both 15-min and 1-hour where available)
+        self.pm_feeds_15m: dict[str, PolymarketFeed] = {}
+        # self.pm_feeds_1h: dict[str, PolymarketFeed] = {}  # TODO: Add 1-hour market discovery
+        
+        # Strategy
+        self.strategy: AdvancedMakerArb = None
+        
+        # Control
+        self._running = False
+        self._shutdown_event = asyncio.Event()
+        self._start_time = None
+    
+    async def initialize(self) -> bool:
+        """Initialize all components."""
+        mode_str = "🧪 VIRTUAL" if self.virtual_mode else "💰 REAL"
+        self.logger.info(
+            f"🏦 Initializing Advanced Maker Arb ({mode_str})",
+            capital=f"${self.capital:.2f}",
+            assets=self.assets,
+        )
+        
+        # Initialize strategy
+        self.strategy = AdvancedMakerArb(
+            virtual_mode=self.virtual_mode,
+            capital_usd=self.capital,
+        )
+        
+        self.strategy.set_callbacks(
+            on_opportunity=self._on_opportunity,
+        )
+        
+        # Initialize feeds for each asset
+        for asset in self.assets:
+            try:
+                await self._init_asset_feeds(asset)
+            except Exception as e:
+                self.logger.error(f"Failed to initialize {asset} feeds", error=str(e))
+                continue
+        
+        if not self.feeds:
+            self.logger.error("❌ No assets initialized")
+            return False
+        
+        self.logger.info(
+            "✅ Advanced strategy initialized",
+            assets=list(self.feeds.keys()),
+        )
+        return True
+    
+    async def _init_asset_feeds(self, asset: str) -> None:
+        """Initialize feeds for a single asset."""
+        symbols = settings.exchanges.symbols.get(asset, {})
+        
+        binance = BinanceFeed(symbols.get("binance", f"{asset.lower()}usdt"))
+        coinbase = CoinbaseFeed(symbols.get("coinbase", f"{asset}-USD"))
+        kraken = KrakenFeed(symbols.get("kraken", f"{asset}/USD"))
+        
+        pm_feed = PolymarketFeed(asset=asset)
+        consensus = ConsensusEngine()
+        
+        def make_callback(eng, feed, name):
+            def cb(tick):
+                metrics = feed.get_metrics()
+                eng.update_exchange(name, metrics)
+            return cb
+        
+        binance.add_callback(make_callback(consensus, binance, "binance"))
+        coinbase.add_callback(make_callback(consensus, coinbase, "coinbase"))
+        kraken.add_callback(make_callback(consensus, kraken, "kraken"))
+        
+        self.feeds[asset] = {
+            "binance": binance,
+            "coinbase": coinbase,
+            "kraken": kraken,
+        }
+        self.consensus_engines[asset] = consensus
+        self.pm_feeds_15m[asset] = pm_feed
+    
+    async def start(self) -> None:
+        """Start all strategies."""
+        import time
+        self._running = True
+        self._start_time = time.time()
+        
+        # Start all feeds
+        for asset, feeds in self.feeds.items():
+            for name, feed in feeds.items():
+                asyncio.create_task(feed.start())
+                self.logger.debug(f"Started {name} feed for {asset}")
+        
+        for asset, pm_feed in self.pm_feeds_15m.items():
+            asyncio.create_task(pm_feed.start())
+            self.logger.debug(f"Started Polymarket 15m feed for {asset}")
+        
+        # Wait for feeds to connect
+        await asyncio.sleep(5)
+        
+        # Start strategy
+        await self.strategy.start()
+        
+        # Run loops
+        await asyncio.gather(
+            self._scan_loop(),
+            self._status_loop(),
+        )
+    
+    async def _scan_loop(self) -> None:
+        """Main scanning loop."""
+        self.logger.info("🔍 Scan loop started - monitoring for opportunities")
+        
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                for asset in self.feeds.keys():
+                    consensus = self.consensus_engines.get(asset)
+                    pm_feed = self.pm_feeds_15m.get(asset)
+                    
+                    if not consensus or not pm_feed:
+                        continue
+                    
+                    consensus_data = consensus.compute_consensus()
+                    pm_data = pm_feed.get_data()
+                    
+                    if not consensus_data or not pm_data:
+                        continue
+                    
+                    # Check 15-min market
+                    await self.strategy.check_opportunity(
+                        asset=asset,
+                        market_type="15m",
+                        consensus=consensus_data,
+                        pm_data=pm_data,
+                    )
+                    
+                    # TODO: Also check 1-hour markets when we add that feed
+                
+                await asyncio.sleep(0.5)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Scan loop error", error=str(e))
+                await asyncio.sleep(1)
+    
+    async def _status_loop(self) -> None:
+        """Periodic status logging."""
+        import time
+        
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)
+                
+                runtime = time.time() - self._start_time
+                hours = int(runtime // 3600)
+                minutes = int((runtime % 3600) // 60)
+                
+                # Get prices
+                prices = {}
+                for asset, consensus in self.consensus_engines.items():
+                    data = consensus.compute_consensus()
+                    if data:
+                        prices[asset] = f"${data.consensus_price:.2f}"
+                
+                summary = self.strategy.get_summary()
+                
+                self.logger.info(
+                    "📊 STRATEGY STATUS",
+                    runtime=f"{hours}h {minutes}m",
+                    prices=prices,
+                    **summary,
+                )
+                
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+    
+    def _on_opportunity(self, log) -> None:
+        """Called when an opportunity is detected."""
+        self.logger.info(
+            f"💰 {log.strategy.upper()} OPPORTUNITY",
+            asset=log.asset,
+            market_type=log.market_type,
+            gap=f"{log.potential_gap_pct:.2%}",
+            fee=f"{log.dynamic_fee_pct:.2%}",
+            net_pnl=f"${log.net_virtual_pnl:.2f}",
+        )
+    
+    async def stop(self) -> None:
+        """Stop gracefully."""
+        self._running = False
+        self._shutdown_event.set()
+        
+        if self.strategy:
+            await self.strategy.stop()
+        
+        for asset, feeds in self.feeds.items():
+            for name, feed in feeds.items():
+                try:
+                    await feed.stop()
+                except Exception:
+                    pass
+        
+        for pm_feed in self.pm_feeds_15m.values():
+            try:
+                await pm_feed.stop()
+            except Exception:
+                pass
+        
+        self.logger.info("✅ Advanced runner stopped")
+
+
+async def main():
+    """Main entry point."""
+    runner = AdvancedRunner()
+    
+    def signal_handler(sig, frame):
+        logger.info("🛑 Shutdown requested...")
+        asyncio.create_task(runner.stop())
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║     ADVANCED MAKER ARB - POST JAN 2026 FEE STRUCTURE         ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Strategy Modes:                                             ║
+║    📈 SNIPER - Fee-free 1h/daily markets                    ║
+║    🎯 EXTREME - Low-fee plays at price extremes             ║
+║    🏦 MAKER - Rebate earning on mid-price 15m markets       ║
+║                                                              ║
+║  All trades logged to logs/maker_arb/*.csv                  ║
+║  Press Ctrl+C to stop and export                            ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+    
+    if not await runner.initialize():
+        logger.error("❌ Failed to initialize")
+        return 1
+    
+    try:
+        await runner.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await runner.stop()
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)
+

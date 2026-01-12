@@ -97,14 +97,14 @@ executor = MakerOrderExecutor(private_key=PRIVATE_KEY)
 await executor.initialize()
 
 result = await executor.place_maker_order(
-    token_id=token_id,
+            token_id=token_id,
     side="BUY",
-    size=100,
+            size=100,
     target_price=0.52,
     best_bid=0.50,
     best_ask=0.54,
 )
-
+    
 if result.success:
     print(f"Filled at {result.fill_price}, rebate: €{result.rebate_earned}")
 else:

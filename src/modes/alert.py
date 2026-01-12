@@ -215,7 +215,7 @@ class AlertMode(BaseMode):
         HIGH_DIV_OVERRIDE = 0.80  # 80% divergence score = definitely process
         if breakdown and breakdown.divergence >= HIGH_DIV_OVERRIDE:
             self.logger.info(
-                "🚀 HIGH DIVERGENCE OVERRIDE - Processing despite low confidence",
+                "🚀 HIGH DIVERGENCE - Processing signal",
                 asset=signal.asset,
                 confidence=f"{confidence:.1%}",
                 divergence_score=f"{breakdown.divergence:.1%}",
@@ -312,10 +312,15 @@ class AlertMode(BaseMode):
                             asset=asset,
                             yes_ask=pm_data.yes_ask,
                         )
+                        # Use aggressive mode for high divergence (>25%) for instant fills
+                        divergence = signal.scoring.breakdown.divergence if signal.scoring else 0
+                        use_aggressive = divergence > 0.25
+                        
                         real_position = await self._real_trader.open_position(
                             signal=signal,
                             pm_data=pm_data,
                             asset=asset,
+                            aggressive=use_aggressive,
                         )
                         if real_position:
                             real_position_opened = True
@@ -505,17 +510,18 @@ class AlertMode(BaseMode):
         if not self._alerter:
             return
         
-        # Send Discord alert for real trade
-        await self._alerter.send_message(
-            title="🔴 REAL TRADE OPENED",
-            description=f"**{position.asset} {position.direction}**",
-            color=0xFF0000,  # Red for real money
-            fields=[
-                ("Entry Price", f"${position.entry_price:.3f}", True),
-                ("Size", f"€{position.size_eur:.2f}", True),
-                ("Order ID", position.order_id[:8] if position.order_id else "N/A", True),
+        # Send Discord embed for real trade
+        embed = {
+            "title": "🔴 REAL TRADE OPENED",
+            "description": f"**{position.asset} {position.direction}**",
+            "color": 0xFF0000,  # Red for real money
+            "fields": [
+                {"name": "Entry Price", "value": f"${position.entry_price:.3f}", "inline": True},
+                {"name": "Size", "value": f"€{position.size_eur:.2f}", "inline": True},
+                {"name": "Order ID", "value": position.order_id[:8] if position.order_id else "N/A", "inline": True},
             ],
-        )
+        }
+        await self._alerter.send_embed(embed)
     
     async def _on_real_position_closed(
         self,
@@ -539,20 +545,21 @@ class AlertMode(BaseMode):
             emoji = "🔴"
             color = 0xFF0000
         
-        # Send Discord alert for real trade close
-        await self._alerter.send_message(
-            title=f"{emoji} REAL TRADE CLOSED",
-            description=f"**{position.asset} {position.direction}** - {position.exit_reason}",
-            color=color,
-            fields=[
-                ("Entry", f"${position.entry_price:.3f}", True),
-                ("Exit", f"${position.exit_price:.3f}" if position.exit_price else "N/A", True),
-                ("P&L", f"€{pnl:+.2f}", True),
-                ("Duration", f"{position.duration_seconds:.0f}s", True),
-                ("Rebates", f"€{position.rebates_earned_eur:.4f}", True),
-                ("Today's Loss", f"€{self._real_daily_loss:.2f}", True),
+        # Send Discord embed for real trade close
+        embed = {
+            "title": f"{emoji} REAL TRADE CLOSED",
+            "description": f"**{position.asset} {position.direction}** - {position.exit_reason}",
+            "color": color,
+            "fields": [
+                {"name": "Entry", "value": f"${position.entry_price:.3f}", "inline": True},
+                {"name": "Exit", "value": f"${position.exit_price:.3f}" if position.exit_price else "N/A", "inline": True},
+                {"name": "P&L", "value": f"€{pnl:+.2f}", "inline": True},
+                {"name": "Duration", "value": f"{position.duration_seconds:.0f}s", "inline": True},
+                {"name": "Rebates", "value": f"€{position.rebates_earned_eur:.4f}", "inline": True},
+                {"name": "Today's Loss", "value": f"€{self._real_daily_loss:.2f}", "inline": True},
             ],
-        )
+        }
+        await self._alerter.send_embed(embed)
     
     # ==========================================================================
     # Periodic Tasks

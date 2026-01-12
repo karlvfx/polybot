@@ -68,6 +68,86 @@ AGGREGATOR_V3_ABI = [
 
 
 @dataclass
+class WindowPriceTracker:
+    """
+    Tracks Chainlink prices at 15-minute window boundaries.
+    
+    This is CRITICAL for 15-min up/down markets:
+    - Market resolves UP if: price_at_end >= price_at_start
+    - Market resolves DOWN if: price_at_end < price_at_start
+    
+    We need to track the price at window START to determine true direction.
+    """
+    # Window interval in seconds (15 minutes)
+    interval_seconds: int = 900
+    
+    # Cached window start prices: window_end_ts -> price
+    _window_start_prices: dict = field(default_factory=dict)
+    
+    # Current price (latest from Chainlink)
+    current_price: float = 0.0
+    
+    def update_price(self, price: float, timestamp_seconds: int) -> None:
+        """Update current price and record window start price if at boundary."""
+        self.current_price = price
+        
+        # Calculate which window we're in
+        window_end = ((timestamp_seconds // self.interval_seconds) + 1) * self.interval_seconds
+        window_start = window_end - self.interval_seconds
+        
+        # If we don't have a start price for this window yet, record it
+        if window_end not in self._window_start_prices:
+            self._window_start_prices[window_end] = price
+            # Cleanup old entries (keep last 10 windows)
+            self._cleanup_old_windows(window_end)
+    
+    def _cleanup_old_windows(self, current_window_end: int) -> None:
+        """Remove old window entries to prevent memory growth."""
+        cutoff = current_window_end - (10 * self.interval_seconds)
+        old_keys = [k for k in self._window_start_prices if k < cutoff]
+        for k in old_keys:
+            del self._window_start_prices[k]
+    
+    def get_window_start_price(self, window_end_ts: int = 0) -> float:
+        """Get the start price for a specific window."""
+        if window_end_ts == 0:
+            # Use current window
+            now = int(time.time())
+            window_end_ts = ((now // self.interval_seconds) + 1) * self.interval_seconds
+        return self._window_start_prices.get(window_end_ts, 0.0)
+    
+    def get_window_move_pct(self, window_end_ts: int = 0) -> float:
+        """
+        Calculate current price move relative to window start.
+        
+        This is the KEY metric for determining UP/DOWN direction!
+        
+        Returns:
+            Percentage move from window start (positive = up, negative = down)
+        """
+        start_price = self.get_window_start_price(window_end_ts)
+        if start_price <= 0 or self.current_price <= 0:
+            return 0.0
+        return (self.current_price - start_price) / start_price
+    
+    def get_current_window_info(self) -> dict:
+        """Get info about the current window."""
+        now = int(time.time())
+        window_end = ((now // self.interval_seconds) + 1) * self.interval_seconds
+        window_start = window_end - self.interval_seconds
+        time_remaining = window_end - now
+        
+        return {
+            "window_start_ts": window_start,
+            "window_end_ts": window_end,
+            "time_remaining_seconds": time_remaining,
+            "window_start_price": self.get_window_start_price(window_end),
+            "current_price": self.current_price,
+            "window_move_pct": self.get_window_move_pct(window_end),
+        }
+
+
+@dataclass
 class HeartbeatTracker:
     """Tracks oracle heartbeat intervals for prediction."""
     intervals: deque = field(default_factory=lambda: deque(maxlen=20))
@@ -145,6 +225,9 @@ class ChainlinkFeed:
         # Heartbeat tracking
         self._heartbeat_tracker = HeartbeatTracker()
         
+        # Window price tracking (CRITICAL for 15-min up/down markets)
+        self._window_tracker = WindowPriceTracker()
+        
         # Health
         self.connected = False
         self.last_poll_ms: int = 0
@@ -220,6 +303,9 @@ class ChainlinkFeed:
             
             # Convert price using decimals
             price = answer / (10 ** self._decimals)
+            
+            # Update window price tracker (CRITICAL for 15-min market direction)
+            self._window_tracker.update_price(price, int(time.time()))
             
             # Check for new round (oracle update)
             if round_id > self._last_round_id and self._last_round_id > 0:
@@ -325,8 +411,27 @@ class ChainlinkFeed:
             ) / 1000
         return self._current_data
     
+    def get_window_info(self) -> dict:
+        """
+        Get current 15-minute window price info.
+        
+        CRITICAL for 15-min up/down markets:
+        - window_start_price: Chainlink price at window start
+        - window_move_pct: Current move from window start (+ = up, - = down)
+        """
+        return self._window_tracker.get_current_window_info()
+    
+    def get_window_move_pct(self, window_end_ts: int = 0) -> float:
+        """Get the percentage move from window start to current price."""
+        return self._window_tracker.get_window_move_pct(window_end_ts)
+    
+    def get_window_start_price(self, window_end_ts: int = 0) -> float:
+        """Get the Chainlink price at the start of the specified window."""
+        return self._window_tracker.get_window_start_price(window_end_ts)
+    
     def get_metrics(self) -> dict:
         """Get feed health metrics."""
+        window_info = self._window_tracker.get_current_window_info()
         return {
             "name": "chainlink",
             "connected": self.connected,
@@ -336,6 +441,9 @@ class ChainlinkFeed:
             "oracle_age_seconds": self._current_data.oracle_age_seconds if self._current_data else None,
             "avg_heartbeat_interval": self._heartbeat_tracker.avg_interval,
             "is_fast_heartbeat_mode": self._heartbeat_tracker.is_fast_heartbeat_mode(),
+            "window_start_price": window_info.get("window_start_price", 0),
+            "window_move_pct": window_info.get("window_move_pct", 0),
+            "window_time_remaining": window_info.get("time_remaining_seconds", 0),
         }
 
 

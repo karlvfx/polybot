@@ -1,254 +1,171 @@
-# Polymarket Oracle-Lag Trading Bot
+# Polymarket Trading Bot - Post-Mortem
 
-A sophisticated trading bot that exploits the delay between real-time cryptocurrency spot prices and Chainlink oracle updates on Polymarket's 15-minute up/down prediction markets.
+## ⚠️ Status: EXPERIMENTAL - Real Trading Disabled
 
-## 🎯 Strategy Overview
+This bot was an attempt to exploit market maker lag on Polymarket's 15-minute crypto up/down markets. **It did not work as intended and resulted in losses.**
 
-This bot identifies and trades mispricing windows that occur when:
-1. **Spot prices move significantly** (>0.7% in 30 seconds)
-2. **Oracle data is stale** (6-75 seconds old)
-3. **Polymarket odds haven't adjusted** to the new price reality
+---
 
-The typical edge window is **30-90 seconds** before the Chainlink oracle updates and market makers reprice.
+## 📊 Results Summary
 
-## 🏗️ Architecture
+| Metric | Value |
+|--------|-------|
+| Total Trades | 56 |
+| Money Spent | ~$272 |
+| Money Lost | ~$260 |
+| Final Balance | $9.15 |
+| Win Rate | Below 50% |
+| Time Invested | ~1 week |
 
+---
+
+## 🎯 Original Strategy
+
+### The Thesis
+1. **Spot price moves** on centralized exchanges (Binance, Kraken, Coinbase)
+2. **Polymarket odds lag** behind by 8-12 seconds (market maker delay)
+3. **Detect divergence** between spot-implied probability and PM odds
+4. **Bet before MMs reprice** → profit from information edge
+
+### How It Worked
 ```
-Multi-Exchange Spot Feed (Binance + Coinbase + Kraken WebSocket)
-    ↓
-Spot Consensus Engine (weighted avg, outlier rejection)
-    ↓
-Oracle Age Monitor (Chainlink on-chain feed tracking)
-    ↓
-Polymarket Orderbook Monitor (WebSocket, 500ms snapshots)
-    ↓
-Signal Detection + Validation Engine
-    ↓
-Confidence Scoring System v2
-    ↓
-Mode Router (Shadow / Alert / Night Auto)
-    ↓
-Execution Engine (nonce mgmt, gas optimization)
-    ↓
-Comprehensive Logging System
+Spot Price Moves → Calculate Implied Probability → Compare to PM Odds → Trade if Divergence > 5%
 ```
 
-## 🚀 Quick Start
+### The Markets
+- 15-minute ETH/BTC/SOL up/down markets on Polymarket
+- Binary outcome: UP (price ends higher than start) or DOWN
+- Settlement via Chainlink Data Streams
 
-### Prerequisites
+---
 
-- Python 3.11+
-- Polygon RPC endpoint (Alchemy or Ankr recommended)
-- Discord webhook (for alerts)
+## ❌ Why It Failed
 
-### Installation
+### 1. No Real Edge
+| Assumption | Reality |
+|------------|---------|
+| "MMs are slow (8-12s)" | Polymarket uses Chainlink Data Streams (~100ms). MMs have fast feeds too. |
+| "30s momentum predicts outcome" | No evidence. Markets mean-revert. Spikes can reverse. |
+| "Divergence = mispricing" | More likely: PM was correctly priced, we were wrong. |
+| "We're outsmarting MMs" | We're retail. They're professionals with better infrastructure. |
 
-```bash
-# Clone the repository
-cd polymarket-oracle-bot
+### 2. Technical Issues (Secondary)
+- Exit orders failed with "not enough balance/allowance" errors
+- Markets settled before exits could complete
+- Settlement detection was buggy (reported wins when positions lost)
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
+### 3. Fundamental Flaw
+The bot used **30-second price momentum** to predict direction, but 15-minute markets settle based on **window start vs window end price**. These are not the same thing.
 
-# Install dependencies
-pip install -r requirements.txt
+---
 
-# Copy and configure environment
-cp .env.example .env
-# Edit .env with your configuration
+## 🏗️ What Was Built
+
+### Infrastructure (Working)
+- Multi-exchange price feeds (Binance, Kraken, Coinbase)
+- Polymarket CLOB integration (orders, positions, balances)
+- Chainlink oracle monitoring
+- Discord alerts
+- Virtual trading simulation
+- Real trading execution (maker orders with rebates)
+
+### Key Files
 ```
+src/
+├── feeds/
+│   ├── binance.py      # Binance WebSocket feed
+│   ├── kraken.py       # Kraken WebSocket feed
+│   ├── coinbase.py     # Coinbase WebSocket feed
+│   ├── polymarket.py   # PM orderbook + market discovery
+│   └── chainlink.py    # Oracle price + window tracking
+├── engine/
+│   ├── signal_detector.py  # Divergence detection
+│   ├── consensus.py        # Multi-exchange price consensus
+│   ├── confidence.py       # Signal scoring
+│   └── validator.py        # Signal validation
+├── trading/
+│   ├── real_trader.py      # Real position management
+│   └── maker_orders.py     # CLOB order execution
+└── modes/
+    ├── alert.py            # Alert mode with virtual/real trading
+    └── virtual_trader.py   # Paper trading simulation
+```
+
+---
+
+## 💡 Ideas That Might Actually Work
+
+### 1. News/Event-Based Trading
+- Political markets where human judgment matters
+- Sports markets where you have domain expertise
+- Breaking news before it's priced in
+
+### 2. Longer Timeframe Markets
+- Daily/weekly markets where speed doesn't matter
+- Analysis-based edge rather than speed-based
+
+### 3. Market Making
+- Be the MM yourself, earn the spread
+- Requires capital and risk management
+- Polymarket offers rebates for makers
+
+### 4. Less Competitive Markets
+- Smaller, newer prediction markets
+- Niche topics with less sophisticated participants
+
+### 5. Proper Backtesting First
+- Collect historical data
+- Simulate strategy performance
+- Only trade if backtests show positive edge
+
+---
+
+## 🔧 If You Want to Continue
+
+### Before Trading Real Money Again:
+1. **Backtest** - Prove strategy works on historical data
+2. **Paper trade** - Run virtual-only for at least a week
+3. **Small positions** - Never risk more than you can lose
+4. **Clear edge** - Know exactly WHY you have an advantage
 
 ### Configuration
-
-Edit `.env` with your settings:
-
-```env
-# Operating Mode: shadow, alert, night_auto
-MODE=shadow
-
-# Polygon RPC (required)
-CHAINLINK__POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your-api-key
-
-# Wallet (required for night_auto mode)
-WALLET_ADDRESS=0x...
-PRIVATE_KEY=...
-
-# Discord Alerts
-ALERTS__DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-
-# Polymarket Market IDs
-POLYMARKET__BTC_UP_MARKET_ID=...
+```bash
+# .env file
+REAL_TRADING_ENABLED=false  # Keep this OFF until proven
+REAL_TRADING_POSITION_SIZE_EUR=5.0
+REAL_TRADING_MAX_DAILY_LOSS_EUR=25.0
 ```
 
-### Running
-
+### Running Virtual Only
 ```bash
-# Start in shadow mode (recommended for first 2-4 weeks)
+cd polybot
+source venv/bin/activate
 python -m src.main
+# Watch logs - all trades will be virtual
 ```
 
-## 📊 Operating Modes
+---
 
-### 🟡 Shadow Mode (Default)
-- Simulates all trades without real execution
-- Collects comprehensive logs
-- Tracks would-be performance
-- **Run for 2-4 weeks before live trading**
+## 📝 Lessons Learned
 
-### 🔔 Alert Mode
-- Sends Discord notifications for high-confidence signals (≥70%)
-- Human decides whether to trade
-- Good for learning the system
+1. **Validate before deploying** - Paper trade first, always
+2. **Question assumptions** - "MMs are slow" was wrong
+3. **Check trade data early** - Would have caught losses sooner
+4. **Professional MMs are good** - Hard to beat them at speed games
+5. **Time has value** - A week of work is worth more than $300
 
-### 🌙 Night Auto Mode
-- Fully automated conservative trading
-- Active: 02:00-06:00 local time
-- Strict requirements:
-  - ≥85% confidence
-  - €20 max position size
-  - Max 2 trades per night
-  - €40 daily loss limit
+---
 
-## 🔍 Signal Detection
+## 🤝 Acknowledgments
 
-A signal is generated when **ALL** conditions are met:
+Built with:
+- [py-clob-client](https://github.com/Polymarket/py-clob-client) - Polymarket CLOB SDK
+- [web3.py](https://github.com/ethereum/web3.py) - Ethereum interaction
+- [structlog](https://www.structlog.org/) - Structured logging
+- Various exchange WebSocket APIs
 
-| Condition | Threshold |
-|-----------|-----------|
-| Spot move (30s) | > max(0.7%, 1.5 × 5min ATR) |
-| Volume surge | > 2× 5-minute average |
-| Spike concentration | > 60% of move in 10s window |
-| Oracle age | 6-75s (regime-dependent) |
-| Mispricing | > 3% odds misalignment |
-| Liquidity | > €50 at best bid |
-| Volatility filter | < 0.5% (anti-chop) |
-
-### Escape Clause
-For moves between 0.8% and threshold, signals are allowed if:
-- Oracle age ≥ 15s
-- Orderbook imbalance > 20%
-- Liquidity ≥ €75
-- Volume surge > 2.5×
-
-## 📈 Confidence Scoring
-
-| Component | Weight |
-|-----------|--------|
-| Oracle Age | 0.35 |
-| Consensus Strength | 0.25 |
-| Odds Misalignment | 0.15 |
-| Liquidity | 0.10 |
-| Spread Anomaly | 0.08 |
-| Volume Surge | 0.04 |
-| Spike Concentration | 0.03 |
-
-## 📁 Project Structure
-
-```
-polymarket-oracle-bot/
-├── config/
-│   └── settings.py          # Configuration management
-├── src/
-│   ├── feeds/
-│   │   ├── binance.py       # Binance WebSocket
-│   │   ├── coinbase.py      # Coinbase WebSocket
-│   │   ├── kraken.py        # Kraken WebSocket
-│   │   ├── chainlink.py     # Chainlink oracle monitor
-│   │   └── polymarket.py    # Polymarket orderbook
-│   ├── engine/
-│   │   ├── consensus.py     # Multi-exchange aggregation
-│   │   ├── signal_detector.py
-│   │   ├── validator.py
-│   │   ├── confidence.py
-│   │   └── execution.py     # Trade execution
-│   ├── modes/
-│   │   ├── shadow.py
-│   │   ├── alert.py
-│   │   └── night_auto.py
-│   ├── utils/
-│   │   ├── logging.py
-│   │   └── alerts.py        # Discord integration
-│   ├── models/
-│   │   └── schemas.py       # Data models
-│   └── main.py              # Main application
-├── logs/                    # Signal and metrics logs
-├── requirements.txt
-└── .env.example
-```
-
-## 📋 Success Criteria
-
-Before moving to live trading, ensure:
-
-- [ ] 100+ shadow signals logged
-- [ ] Would-be win rate ≥ 65%
-- [ ] Would-be avg profit ≥ €1.50/trade after gas
-- [ ] Oracle timing patterns understood
-- [ ] Signal density: 5-15 per day on BTC
-- [ ] E2E latency consistently < 200ms
-
-## ⚠️ Risk Management
-
-### Circuit Breakers
-- Daily loss limit: €40
-- Max 3 consecutive failed fills
-- Max €10 daily gas spend
-- Automatic pause on errors
-
-### Position Limits
-- 0.5% of bankroll per trade
-- Max 1 concurrent position
-- 5% daily exposure limit
-
-## 🔧 Development
-
-```bash
-# Run tests
-pytest tests/
-
-# Format code
-black src/
-ruff check src/
-
-# Type checking
-mypy src/
-```
-
-## 📝 Logging
-
-Signals are logged to `logs/signals_YYYY-MM-DD.jsonl` with full details:
-- Spot data from all exchanges
-- Oracle state and age
-- Polymarket orderbook snapshot
-- Confidence breakdown
-- Validation results
-- Action taken
-- Outcome (if traded)
-
-## ⚡ Performance Targets
-
-| Metric | Target |
-|--------|--------|
-| Win Rate | ≥ 65% |
-| Avg Profit/Trade | ≥ €1.50 |
-| E2E Latency | < 200ms |
-| Signals/Day | 5-15 |
-
-## 🛑 When to Stop
-
-If after 50 shadow trades:
-- Would-be profit < €30 after gas
-- Win rate < 55%
-- Avg profit/trade < €1.00
-
-**Then this edge doesn't exist for you.** The market may have changed or competition is too fierce.
-
-## 📜 Disclaimer
-
-This software is for educational purposes only. Trading cryptocurrency derivatives carries significant risk. You may lose some or all of your investment. Past performance does not guarantee future results. Understand the risks before trading.
+---
 
 ## 📄 License
 
-MIT License - See LICENSE file for details.
-
+MIT - Use at your own risk. This code lost money. You've been warned.

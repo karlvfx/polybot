@@ -378,7 +378,7 @@ class MarketDiscovery:
             self.logger.warning(f"Unknown asset {self.asset}, using BTC patterns")
             self.asset = "BTC"
         self._patterns = self.ASSET_PATTERNS[self.asset]
-        
+    
         # Combined slugs for backwards compatibility
         self._patterns["slugs"] = self._patterns.get("slugs_15m", [])
         if self.include_hourly:
@@ -1417,15 +1417,17 @@ class PolymarketFeed:
         
         # Check for liquidity collapse (IMPROVED)
         # Old logic was too sensitive for thin markets - flagged normal fluctuations
-        # New logic: Only flag collapse if BOTH conditions are met:
+        # New logic: Only flag collapse if ALL conditions are met:
         #   1. Percentage drop > 50% (was 40%)
-        #   2. AND absolute liquidity is dangerously low (< €25)
-        # This prevents false positives in naturally thin markets
+        #   2. AND absolute liquidity is dangerously low (< €15)
+        #   3. AND we had meaningful historical liquidity (> €50) to compare against
+        # This prevents false positives in naturally thin markets or new markets
         liquidity_collapsing = False
-        MIN_ABSOLUTE_LIQUIDITY = 25.0  # €25 floor
-        COLLAPSE_THRESHOLD_PCT = 0.50  # 50% drop (was 60%, i.e., < 0.6 * historical)
+        MIN_ABSOLUTE_LIQUIDITY = 15.0  # €15 floor (lowered from €25)
+        MIN_HISTORICAL_LIQUIDITY = 50.0  # Need at least €50 history to detect "collapse"
+        COLLAPSE_THRESHOLD_PCT = 0.50  # 50% drop
         
-        if yes_liq_30s > 0 and current_yes_liq > 0:
+        if yes_liq_30s > MIN_HISTORICAL_LIQUIDITY and current_yes_liq > 0:
             pct_of_historical = current_yes_liq / yes_liq_30s
             is_major_drop = pct_of_historical < COLLAPSE_THRESHOLD_PCT
             is_below_absolute_floor = current_yes_liq < MIN_ABSOLUTE_LIQUIDITY
@@ -1689,13 +1691,17 @@ class PolymarketFeed:
     
     async def _market_refresh_loop(self) -> None:
         """
-        Background task to refresh market when current one expires.
+        Background task to refresh market when current one expires or has no data.
         
-        Checks every 30 seconds if market needs to be refreshed.
-        Auto-discovers new market 60 seconds before current window ends.
+        Checks every 10 seconds if market needs to be refreshed.
+        Triggers refresh when:
+        1. Window is ending in <60s (proactive)
+        2. Current market has no liquidity/bid data (reactive)
         """
         # Wait for initial discovery
         await asyncio.sleep(5)
+        
+        consecutive_no_data = 0
         
         while self._running:
             try:
@@ -1704,15 +1710,38 @@ class PolymarketFeed:
                 current_window_end = ((now // 900) + 1) * 900
                 time_until_end = current_window_end - now
                 
-                # If less than 60 seconds until end, start looking for next market
-                if time_until_end < 60:
-                    self.logger.info(
-                        "Market window ending soon, preparing to refresh",
-                        seconds_remaining=time_until_end,
-                    )
+                # Check if current market has no data (bid = 0 means expired/empty)
+                current_data = self.get_data()
+                has_no_data = (
+                    current_data is None or 
+                    (current_data.yes_bid <= 0 and current_data.no_bid <= 0)
+                )
+                
+                if has_no_data:
+                    consecutive_no_data += 1
+                else:
+                    consecutive_no_data = 0
+                
+                # Trigger refresh if:
+                # 1. Window ending soon (proactive)
+                # 2. No market data for 3+ checks (~30s) (reactive - dead market)
+                needs_refresh = time_until_end < 60 or consecutive_no_data >= 3
+                
+                if needs_refresh:
+                    if consecutive_no_data >= 3:
+                        self.logger.warning(
+                            "No market data - forcing discovery",
+                            consecutive_checks=consecutive_no_data,
+                        )
+                    else:
+                        self.logger.info(
+                            "Market window ending soon, preparing to refresh",
+                            seconds_remaining=time_until_end,
+                        )
                     
-                    # Wait for window to end
-                    await asyncio.sleep(time_until_end + 5)
+                    # If window ending, wait for it
+                    if time_until_end < 60 and time_until_end > 0:
+                        await asyncio.sleep(time_until_end + 5)
                     
                     # Discover new market
                     if await self._discover_market(force=True):
@@ -1721,16 +1750,17 @@ class PolymarketFeed:
                             self.logger.warning("Failed to fetch new token IDs")
                         else:
                             self.logger.info("Connected to new market")
+                            consecutive_no_data = 0  # Reset counter on success
                     else:
                         self.logger.warning("Failed to discover new market, will retry")
                 
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(10)  # Check every 10 seconds (was 30)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error("Market refresh error", error=str(e))
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
     
     async def start(self) -> None:
         """Start the Polymarket feed."""

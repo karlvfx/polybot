@@ -423,7 +423,7 @@ class VirtualTrader:
                     await self._close_virtual_position(position, exit_reason)
                     break
                 
-                await asyncio.sleep(0.5)  # Check every 500ms (was 1s)
+                await asyncio.sleep(0.1)  # Check every 100ms - ultra fast
                 
             except asyncio.CancelledError:
                 self.logger.info("Position monitoring cancelled", position_id=position.position_id)

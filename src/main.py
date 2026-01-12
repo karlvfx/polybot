@@ -134,7 +134,7 @@ class TradingBot:
         
         # Metrics
         self._last_signal_check_ms = 0
-        self._signal_check_interval_ms = 500  # Check every 500ms
+        self._signal_check_interval_ms = 100  # Check every 100ms - ultra fast
     
     def _setup_exchange_callbacks(self) -> None:
         """Register callbacks for exchange data updates."""
@@ -291,14 +291,24 @@ class TradingBot:
             consensus = feeds.consensus_engine.compute_consensus() if feeds.consensus_engine else None
             oracle = feeds.chainlink.get_data() if feeds.chainlink else None
             pm_data = feeds.polymarket.get_data() if feeds.polymarket else None
+            chainlink_feed = feeds.chainlink
         else:
             # Legacy single-asset mode
             consensus = self.consensus_engine.compute_consensus()
             oracle = self.chainlink_feed.get_data() if self.chainlink_feed else None
             pm_data = self.polymarket_feed.get_data() if self.polymarket_feed else None
+            chainlink_feed = self.chainlink_feed
         
         if not consensus:
             return
+        
+        # CRITICAL: Inject window timing info from Chainlink into pm_data
+        # This enables window-aware direction logic in signal detector
+        if pm_data and chainlink_feed:
+            window_info = chainlink_feed.get_window_info()
+            pm_data.window_start_price = window_info.get("window_start_price", 0.0)
+            pm_data.window_end_ts = window_info.get("window_end_ts", 0)
+            pm_data.window_start_ts = window_info.get("window_start_ts", 0)
         
         # Oracle is optional for some assets (like XRP)
         # But we still need Polymarket data
@@ -665,7 +675,7 @@ class TradingBot:
         while self._running:
             try:
                 await self._check_signals()
-                await asyncio.sleep(0.5)  # 500ms tick (matches signal check interval)
+                await asyncio.sleep(0.1)  # 100ms tick - ultra fast
             except asyncio.CancelledError:
                 self.logger.info("Signal loop cancelled")
                 break

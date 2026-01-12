@@ -19,7 +19,7 @@ import structlog
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
+    from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, AssetType, BalanceAllowanceParams
     from py_clob_client.order_builder.constants import BUY, SELL
     PY_CLOB_AVAILABLE = True
     
@@ -38,6 +38,8 @@ except ImportError:
     OrderType = None
     MarketOrderArgs = None
     PartialCreateOrderOptions = None
+    AssetType = None
+    BalanceAllowanceParams = None
     PARTIAL_OPTIONS_AVAILABLE = False
     BUY = SELL = None
 
@@ -89,7 +91,7 @@ class MakerOrderExecutor:
     """
     
     # Maker order configuration
-    MAKER_TIMEOUT_SECONDS = 3.5  # Max wait for fill (edge decays quickly)
+    MAKER_TIMEOUT_SECONDS = 1.5  # Fast timeout - edge decays quickly
     TICK_SIZE = "0.01"  # Polymarket minimum price increment (as string for API)
     TICK_SIZE_FLOAT = 0.01  # Same as above but as float for math operations
     NEG_RISK = False    # Standard YES/NO tokens
@@ -140,6 +142,9 @@ class MakerOrderExecutor:
             # Derive API credentials
             self._client.set_api_creds(self._client.derive_api_key())
             
+            # Ensure ERC-1155 approval for selling shares
+            await self._ensure_conditional_token_approval()
+            
             self._initialized = True
             self.logger.info("Maker executor initialized successfully")
             return True
@@ -147,6 +152,93 @@ class MakerOrderExecutor:
         except Exception as e:
             self.logger.error("Failed to initialize maker executor", error=str(e))
             return False
+    
+    async def _ensure_conditional_token_approval(self) -> bool:
+        """
+        Ensure the Exchange contract is approved to transfer conditional tokens.
+        
+        This is required for selling shares. Without this approval, all sell
+        orders will fail with 'not enough balance / allowance'.
+        """
+        try:
+            from web3 import Web3
+            
+            # Connect to Polygon
+            w3 = Web3(Web3.HTTPProvider('https://polygon-rpc.com'))
+            if not w3.is_connected():
+                self.logger.warning("Could not connect to Polygon RPC for approval check")
+                return False
+            
+            account = w3.eth.account.from_key(self._private_key)
+            
+            # Contract addresses
+            EXCHANGE = self._client.get_exchange_address()
+            CONDITIONAL_TOKEN = self._client.get_conditional_address()
+            
+            # ERC-1155 ABI (minimal)
+            erc1155_abi = [
+                {
+                    'inputs': [
+                        {'name': 'operator', 'type': 'address'},
+                        {'name': 'approved', 'type': 'bool'}
+                    ],
+                    'name': 'setApprovalForAll',
+                    'outputs': [],
+                    'stateMutability': 'nonpayable',
+                    'type': 'function'
+                },
+                {
+                    'inputs': [
+                        {'name': 'account', 'type': 'address'},
+                        {'name': 'operator', 'type': 'address'}
+                    ],
+                    'name': 'isApprovedForAll',
+                    'outputs': [{'name': '', 'type': 'bool'}],
+                    'stateMutability': 'view',
+                    'type': 'function'
+                }
+            ]
+            
+            ct_contract = w3.eth.contract(address=CONDITIONAL_TOKEN, abi=erc1155_abi)
+            is_approved = ct_contract.functions.isApprovedForAll(account.address, EXCHANGE).call()
+            
+            if is_approved:
+                self.logger.info("✅ Exchange already approved for conditional tokens")
+                return True
+            
+            self.logger.warning("Exchange NOT approved - setting approval now...")
+            
+            # Build and send approval transaction
+            nonce = w3.eth.get_transaction_count(account.address)
+            gas_price = w3.eth.gas_price
+            
+            tx = ct_contract.functions.setApprovalForAll(EXCHANGE, True).build_transaction({
+                'from': account.address,
+                'nonce': nonce,
+                'gas': 100000,
+                'gasPrice': gas_price,
+            })
+            
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            self.logger.info(f"Approval transaction sent: {tx_hash.hex()}")
+            
+            # Wait for confirmation
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            
+            if receipt['status'] == 1:
+                self.logger.info("✅ Exchange approved for conditional tokens!")
+                return True
+            else:
+                self.logger.error("❌ Approval transaction failed!")
+                return False
+                
+        except ImportError:
+            self.logger.warning("web3 not installed - skipping approval check")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error checking/setting approval: {e}")
+            return True  # Continue anyway, might already be approved
     
     def _get_tick_size(self, token_id: str) -> str:
         """
@@ -215,6 +307,15 @@ class MakerOrderExecutor:
         
         return round(maker_price, 2)
     
+    async def _ensure_sell_allowance(self, token_id: str) -> bool:
+        """
+        Legacy method - approval is now handled at initialization via setApprovalForAll.
+        Kept for compatibility but does nothing.
+        """
+        # Approval is now set once at startup via _ensure_conditional_token_approval()
+        # No per-token approval needed for ERC-1155
+        return True
+    
     async def place_maker_order(
         self,
         token_id: str,
@@ -223,9 +324,10 @@ class MakerOrderExecutor:
         target_price: float,
         best_bid: float,
         best_ask: float,
+        aggressive: bool = False,
     ) -> MakerOrderResult:
         """
-        Place a maker-only order with timeout.
+        Place an order with timeout.
         
         Args:
             token_id: Polymarket token ID (YES or NO)
@@ -234,6 +336,7 @@ class MakerOrderExecutor:
             target_price: Maximum price willing to pay (BUY) or minimum (SELL)
             best_bid: Current best bid price
             best_ask: Current best ask price
+            aggressive: If True, use taker price for instant fill (FOK)
             
         Returns:
             MakerOrderResult with fill details
@@ -249,10 +352,43 @@ class MakerOrderExecutor:
         start_time = int(time.time() * 1000)
         
         try:
-            # Calculate maker price (inside spread)
-            maker_price = self._calculate_maker_price(
-                side, best_bid, best_ask, target_price
-            )
+            # For SELL orders, ensure we have allowance set for the conditional token
+            if side == "SELL":
+                await self._ensure_sell_allowance(token_id)
+            
+            # Calculate price - aggressive uses market price for instant fill
+            if aggressive:
+                # Cross the spread for immediate fill
+                if side == "BUY":
+                    maker_price = min(best_ask + 0.01, target_price)  # Hit the ask + buffer
+                else:
+                    maker_price = max(best_bid - 0.01, 0.01)  # Hit the bid - buffer
+                self.logger.info(
+                    "🚀 AGGRESSIVE ORDER - crossing spread",
+                    token_id=token_id[:16] + "...",
+                    side=side,
+                    price=maker_price,
+                )
+            else:
+                # Calculate maker price (inside spread)
+                maker_price = self._calculate_maker_price(
+                    side, best_bid, best_ask, target_price
+                )
+            
+            # Round to Polymarket precision requirements
+            # Use integer sizes to ensure clean maker amounts (size * price = 2 decimals)
+            from decimal import Decimal, ROUND_DOWN
+            
+            price_dec = Decimal(str(maker_price)).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+            maker_price = float(price_dec)
+            
+            # Use integer size for guaranteed clean maker amount
+            size_dec = Decimal(str(size)).quantize(Decimal('1'), rounding=ROUND_DOWN)
+            size = float(size_dec)
+            
+            # Ensure minimum size of 1
+            if size < 1:
+                size = 1.0
             
             self.logger.info(
                 "Placing maker order",
@@ -283,6 +419,10 @@ class MakerOrderExecutor:
             order = None
             last_error = None
             
+            # Use FOK for aggressive orders (instant fill or cancel)
+            # Use GTC for maker orders (wait for fill)
+            order_type = OrderType.FOK if aggressive else OrderType.GTC
+            
             # Method 1: Use PartialCreateOrderOptions if available
             if PARTIAL_OPTIONS_AVAILABLE and PartialCreateOrderOptions:
                 try:
@@ -291,7 +431,7 @@ class MakerOrderExecutor:
                         neg_risk=self.NEG_RISK,
                     )
                     signed_order = self._client.create_order(order_args, options)
-                    order = self._client.post_order(signed_order, OrderType.GTC)
+                    order = self._client.post_order(signed_order, order_type)
                     self.logger.debug("Order created with PartialCreateOrderOptions")
                 except Exception as e:
                     last_error = e
@@ -300,7 +440,7 @@ class MakerOrderExecutor:
             # Method 2: Try create_and_post_order (simpler API)
             if order is None:
                 try:
-                    order = self._client.create_and_post_order(order_args, OrderType.GTC)
+                    order = self._client.create_and_post_order(order_args, order_type)
                     self.logger.debug("Order created with create_and_post_order")
                 except Exception as e:
                     last_error = e
@@ -310,7 +450,7 @@ class MakerOrderExecutor:
             if order is None:
                 try:
                     signed_order = self._client.create_order(order_args)
-                    order = self._client.post_order(signed_order, OrderType.GTC)
+                    order = self._client.post_order(signed_order, order_type)
                     self.logger.debug("Order created with simple create_order")
                 except Exception as e:
                     last_error = e
@@ -401,12 +541,20 @@ class MakerOrderExecutor:
         
         Returns True if filled, False if timeout.
         """
-        check_interval = 0.2  # Check every 200ms
+        check_interval = 0.1  # Check every 100ms - ultra fast
         elapsed = 0.0
         
         while elapsed < timeout_seconds:
             try:
                 order_status = self._client.get_order(order_id)
+                
+                # Handle None response from API
+                if order_status is None:
+                    self.logger.debug("Order status returned None, retrying...")
+                    await asyncio.sleep(check_interval)
+                    elapsed += check_interval
+                    continue
+                
                 status = order_status.get("status", "").upper()
                 
                 if status in ("MATCHED", "FILLED"):

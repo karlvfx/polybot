@@ -141,7 +141,7 @@ class SignalSettings(BaseSettings):
     
     # Liquidity - UPDATED: Increased from €1 (way too low!)
     # At €1, you're trading into markets with €10-50 total liquidity
-    min_liquidity_eur: float = 50.0  # EUR at best price - need enough to fill €20 position
+    min_liquidity_eur: float = 10.0  # Production: ensure enough liquidity to fill positions
     liquidity_collapse_threshold: float = 0.50  # 50% drop triggers alert (was 60% - too sensitive)
 
 
@@ -209,7 +209,7 @@ class RiskSettings(BaseSettings):
     max_daily_gas_spend_eur: float = 10.0
     
     # Night mode limits
-    night_mode_max_position_eur: float = 20.0
+    night_mode_max_position_eur: float = 5.0
     night_mode_max_trades: int = 2
     night_mode_max_loss_eur: float = 40.0
     night_mode_min_confidence: float = 0.85
@@ -296,11 +296,11 @@ class AssetConfigs(BaseSettings):
     
     # ETH: "Sensitivity" Strategy - Unlock dormant asset
     # Lower volatility means smaller moves are more significant
-    # v2.1: Lowered liquidity to €15 to unlock 24-29% divergence opportunities
+    # v2.3: Lowered liquidity to €8 to match SOL
     ETH: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         # Signal Detection - More sensitive
-        min_liquidity_eur=15.0,   # ↓ from 30€ - unlock high-div opportunities (was rejecting 24-29% divs)
-        min_divergence_pct=0.065, # 6.5% - catch smaller divergences (↓ from 7%)
+        min_liquidity_eur=8.0,   # Production: reasonable liquidity
+        min_divergence_pct=0.05, # 5% - Production: quality ETH signals
         spot_implied_scale=130.0, # ↑ from 100 - more sensitive to small moves
         
         # Staleness Window (ETH MMs slightly slower than BTC)
@@ -323,11 +323,11 @@ class AssetConfigs(BaseSettings):
     
     # SOL: "Momentum" Strategy - THE PROFIT ENGINE
     # Slower MMs (10-15s), higher volatility = let positions breathe
-    # v2.2: Lowered liquidity to €15 to catch 27% divergence opportunities
+    # v2.3: Lowered liquidity to €8 to catch 14-15% divergence opportunities
     SOL: AssetSpecificSettings = Field(default_factory=lambda: AssetSpecificSettings(
         # Signal Detection
-        min_liquidity_eur=15.0,   # ↓ from 30 - was missing 27% div opportunities
-        min_divergence_pct=0.08,  # 8% - proven profitable
+        min_liquidity_eur=8.0,   # Production: reasonable liquidity
+        min_divergence_pct=0.06, # 6% - Production: quality SOL signals
         spot_implied_scale=100.0,
         
         # Staleness Window
@@ -373,9 +373,9 @@ class Settings(BaseSettings):
     mode: OperatingMode = OperatingMode.SHADOW
     
     # Real trading toggle (requires private_key to be set)
-    real_trading_enabled: bool = Field(default=False, description="Enable real trading with actual money")
-    real_trading_position_size_eur: float = Field(default=20.0, description="Position size in EUR for real trades")
-    real_trading_max_daily_loss_eur: float = Field(default=100.0, description="Max daily loss before pausing real trades")
+    real_trading_enabled: bool = Field(default=False, description="Enable real trading with actual money - DISABLED until exit bug fixed")
+    real_trading_position_size_eur: float = Field(default=5.0, description="Position size in EUR for real trades")
+    real_trading_max_daily_loss_eur: float = Field(default=25.0, description="Max daily loss before pausing real trades")
     real_trading_max_concurrent_positions: int = Field(default=3, description="Max concurrent real positions")
     
     # Assets to trade (comma-separated)
