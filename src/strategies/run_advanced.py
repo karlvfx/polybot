@@ -191,6 +191,9 @@ class AdvancedRunner:
         while self._running and not self._shutdown_event.is_set():
             try:
                 for asset in self.feeds.keys():
+                    if self._shutdown_event.is_set():
+                        return
+                    
                     consensus = self.consensus_engines.get(asset)
                     pm_feed = self.pm_feeds_15m.get(asset)
                     
@@ -213,13 +216,22 @@ class AdvancedRunner:
                     
                     # TODO: Also check 1-hour markets when we add that feed
                 
-                await asyncio.sleep(0.5)
+                # Interruptible sleep
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.5)
+                    return  # Shutdown signaled
+                except asyncio.TimeoutError:
+                    pass  # Normal, continue scanning
                 
             except asyncio.CancelledError:
-                break
+                return
             except Exception as e:
                 self.logger.error("Scan loop error", error=str(e))
-                await asyncio.sleep(1)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
+                    return
+                except asyncio.TimeoutError:
+                    pass
     
     async def _status_loop(self) -> None:
         """Periodic status logging."""
@@ -227,7 +239,15 @@ class AdvancedRunner:
         
         while self._running and not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(60)
+                # Interruptible 60s sleep
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=60.0)
+                    return  # Shutdown signaled
+                except asyncio.TimeoutError:
+                    pass  # Normal, log status
+                
+                if self._shutdown_event.is_set():
+                    return
                 
                 runtime = time.time() - self._start_time
                 hours = int(runtime // 3600)
@@ -250,7 +270,7 @@ class AdvancedRunner:
                 )
                 
             except asyncio.CancelledError:
-                break
+                return
             except Exception:
                 pass
     
@@ -305,12 +325,17 @@ async def main():
     """Main entry point."""
     runner = AdvancedRunner()
     
-    def signal_handler(sig, frame):
-        logger.info("🛑 Shutdown requested...")
-        asyncio.create_task(runner.stop())
+    # Use asyncio-native signal handling
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def signal_handler():
+        logger.info("🛑 Shutdown requested (Ctrl+C)...")
+        stop_event.set()
+    
+    # Register signal handlers
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
     
     print("""
 ╔══════════════════════════════════════════════════════════════╗
@@ -333,16 +358,39 @@ async def main():
         return 1
     
     try:
-        await runner.start()
-    except KeyboardInterrupt:
+        # Run until stop signal
+        run_task = asyncio.create_task(runner.start())
+        stop_task = asyncio.create_task(stop_event.wait())
+        
+        # Wait for either completion or stop signal
+        done, pending = await asyncio.wait(
+            [run_task, stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+                
+    except asyncio.CancelledError:
         pass
     finally:
+        logger.info("🧹 Cleaning up...")
         await runner.stop()
+        logger.info("✅ Shutdown complete")
     
     return 0
 
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
+    try:
+        exit_code = asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Force quit")
+        exit_code = 0
     sys.exit(exit_code)
 
